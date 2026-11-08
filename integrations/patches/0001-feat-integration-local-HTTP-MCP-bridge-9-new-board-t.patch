@@ -1,0 +1,2665 @@
+From 34f6fc070fe329729a39e84ab103b848c0d4ade7 Mon Sep 17 00:00:00 2001
+From: WorkBuddy <workbuddy@example.com>
+Date: Sun, 8 Nov 2026 00:33:31 +0800
+Subject: [PATCH 1/6] feat(integration): local HTTP MCP bridge + 9 new board
+ tools + porting assets
+
+- mcp_server: add kHttpRpcIdBase + SetResultSink so device tool results can be
+  returned synchronously to a local caller without touching the cloud wss path.
+- notify_http_server: add GET /tools, POST /mcp (generic JSON-RPC relay), and
+  GET/POST /config for NVS websocket.url/token/version + wifi.ota_url. This
+  removes the need to recompile when switching between xiaozhi cloud and a
+  self-hosted MCP gateway.
+- board: register MCP tools regardless of PY32 probe result (previously all
+  10 tools vanished when PY32 was missing); guard servo tools with servo_ok_.
+- board: new tools self.led.set_many / clear / pattern (rainbow/breath/chase),
+  self.face.list / overlay, self.head.get_angles / tilt,
+  self.gateway_config.get / set.
+- porting: stage MIT feetech_scs driver, mDNS discovery, listening_profile,
+  Si12T touch gesture state machine and power-save gate from stackchan-mcp.
+
+NOT COMPILED: no ESP-IDF / Docker toolchain on this machine.
+---
+ main/boards/m5stack-core-s3/PORTING_NOTES.md  | 210 ++++++++++
+ .../boards/m5stack-core-s3/m5stack_core_s3.cc | 330 +++++++++++++++-
+ main/boards/m5stack-core-s3/power_save_gate.h |  45 +++
+ main/boards/m5stack-core-s3/touch_gesture.h   | 368 +++++++++++++++++
+ main/mcp_server.cc                            |   8 +
+ main/mcp_server.h                             |  13 +
+ main/notify_http_server.cc                    | 372 +++++++++++++++---
+ main/notify_http_server.h                     |  42 +-
+ main/porting_extras/README.md                 |  33 ++
+ .../listening_profile/listening_profile.cc    |  26 ++
+ .../listening_profile/listening_profile.h     |  25 ++
+ .../extras/mdns/mdns_candidate_extract.cc     | 166 ++++++++
+ .../extras/mdns/mdns_candidate_extract.h      |  24 ++
+ .../extras/mdns/mdns_gateway_discovery.cc     | 144 +++++++
+ .../extras/mdns/mdns_gateway_discovery.h      |  24 ++
+ .../porting_extras/feetech_scs/CMakeLists.txt |   5 +
+ main/porting_extras/feetech_scs/LICENSE       |  21 +
+ main/porting_extras/feetech_scs/README.md     |  70 ++++
+ .../feetech_scs/feetech_scs.cpp               | 231 +++++++++++
+ main/porting_extras/feetech_scs/feetech_scs.h |  71 ++++
+ 20 files changed, 2163 insertions(+), 65 deletions(-)
+ create mode 100644 main/boards/m5stack-core-s3/PORTING_NOTES.md
+ create mode 100644 main/boards/m5stack-core-s3/power_save_gate.h
+ create mode 100644 main/boards/m5stack-core-s3/touch_gesture.h
+ create mode 100644 main/porting_extras/README.md
+ create mode 100644 main/porting_extras/extras/listening_profile/listening_profile.cc
+ create mode 100644 main/porting_extras/extras/listening_profile/listening_profile.h
+ create mode 100644 main/porting_extras/extras/mdns/mdns_candidate_extract.cc
+ create mode 100644 main/porting_extras/extras/mdns/mdns_candidate_extract.h
+ create mode 100644 main/porting_extras/extras/mdns/mdns_gateway_discovery.cc
+ create mode 100644 main/porting_extras/extras/mdns/mdns_gateway_discovery.h
+ create mode 100644 main/porting_extras/feetech_scs/CMakeLists.txt
+ create mode 100644 main/porting_extras/feetech_scs/LICENSE
+ create mode 100644 main/porting_extras/feetech_scs/README.md
+ create mode 100644 main/porting_extras/feetech_scs/feetech_scs.cpp
+ create mode 100644 main/porting_extras/feetech_scs/feetech_scs.h
+
+diff --git a/main/boards/m5stack-core-s3/PORTING_NOTES.md b/main/boards/m5stack-core-s3/PORTING_NOTES.md
+new file mode 100644
+index 0000000..c1d9b93
+--- /dev/null
++++ b/main/boards/m5stack-core-s3/PORTING_NOTES.md
+@@ -0,0 +1,210 @@
++# firmware/main/boards/stackchan/ AGENTS.md
++
++Board-specific knowledge for the stackchan configuration (CoreS3 + SCS0009 + Si12T + ILI9342). Covers **servo behavior, touch event classification, WS lifecycle, layer architecture, license boundary, and attribution**.
++
++For general ESP32 build/flash/troubleshooting, see `firmware/AGENTS.md`.
++
++## 1. SCS0009 servo behavior
++
++### Wake-up latency after VM_EN HIGH
++
++After `Servo power ENABLED via PY32 pin 0 (VM EN HIGH confirmed)` (~tick 1275), the SCS0009 needs ~200 ms to wake up. During this window, `ReadPos` and `WritePos` return `-1`. This is **not** a bus hang — it self-clears after 250-350 ms.
++
++| Symptom | Cause | Recovery |
++|---|---|---|
++| Bus startup latency | VM_EN HIGH → ~200 ms wake-up | Wait 250-350 ms, self-clears |
++| Bus hang (Issue #100) | Servo internal protection mode (end-stop contact / stall current) | PMIC long-press 6s OFF/ON required |
++
++Boot-early `Boot pre-init ReadPos: yaw_raw=-1 pitch_raw=-1` (at ~tick 140) is within this latency window. The retry mechanism (5x50 ms, 250 ms total, Issue #138 / PR #139) absorbs this.
++
++### `MotionState::current_deg = 0` initial value pitfall
++
++If `MotionState::current_deg` stays at `0` (ReadPos failed without fallback), subsequent `WriteHeadAngles(0, 45, 4000)` interpolation walks through the end-stop region (pos ~620), causing the "boot snap" sound. Fix (PR #139): ReadPos retry + fallback seed `current_deg = BOOT_INIT_PITCH_DEG (=45)`.
++
++### Physical intervention: hand-hold method
++
++During PMIC ON, holding the head at ~45° by hand while the boot-init climb completes (5-6 seconds) is 100% effective — SCS0009 torque is well below human hand resistance. This is the hardware-level fallback until firmware-side fixes fully eliminate the snap.
++
++## 2. Si12T touch event classification
++
++`TouchPollTick()` polls the Si12T (12-channel capacitive touch IC, I2C 0x68) every 50 ms and feeds `TouchGestureTracker` (`touch_gesture.h`, ESP-IDF-free, unit-tested in `firmware/host_test/test_touch_gesture.cc`). TAP / STROKE are decided from **finger movement across the three head zones**, not from how long the pad was held.
++
++### Chip initialisation (`Si12T::Begin()`, every boot)
++
++The Si12T keeps its registers across an ESP32 reset, so a stuck baseline or the previous firmware's settings survive. `Begin()` therefore follows the datasheet start-up order every time: CTRL=0x0F (soft reset) → 0x07 → SEN1/SEN2=0x33 (M=1.20 %) → CFIG=0x22 → Ch_on1=0xF8 / Ch_on2=0x3F (CH1-3 enabled, others stopped; bit 4/5 of 0x0D stay 1) → Ref_rst1/2=0x00, Cal_on1/2=0x00 → CTRL=0x03. Registers are logged before and after (`Si12T: before:` / `after:`) and read back; a mismatch fails the init (touch stays off, other features unaffected).
++
++### Gesture rules
++
++| Rule | Value |
++|---|---|
++| `TOUCH_POLL_MS` | 50 |
++| Boot grace | first 10 s after init (the chip's fast-calibration window): nothing is reported; a channel still non-zero when the window ends stays unusable until it reads 0 for 1 s |
++| Press / release confirm | press = 1 sample, release = 3 samples (150 ms) |
++| **STROKE** | during one press the finger left a zone it started on **and** reached a zone it did not start on (each held ≥ 100 ms), or the level-weighted centre moved by one zone, **and** some channel reached level H (3). Reported on release; the face changes the moment the movement is seen |
++| **TAP** | no movement, held 100..500 ms, **and** some channel reached level H (3), screen on or off. A press that stayed at L/M is dropped (`touch press ignored (below H)`, still logged): an untouched head shows L/M bursts (sometimes every ~4 s for minutes), while 40 of 43 finger taps recorded in hands-on sessions reached H (a very light tap that peaks at M is the accepted loss). A press whose first sample lights all three zones is a TAP only if two of them are at H on that sample (the all-zone bursts have at most one H, e.g. `0x3A`) |
++| Stationary hold > 500 ms | no event (logged as `touch press ignored`). A resting hand or a stuck channel therefore never fires |
++| Stuck channel | a channel non-zero for 15 s gets `Si12T::ResetReference()` (Ref_rst bit), is dropped from the decision, and is used again after 1 s of zeros. The press in progress is not reported. Count in `get_touch_state.recalibrations` |
++| Cooldown | 300 ms after the physical release |
++| Charging / backlight switch | when the PMIC charging state or the screen on/off state changes, the tracker drops any press, ignores touch for 1 s, then resets the baseline of CH1-3 (`Ref_rst`) and keeps them unusable until each reads 0 for 1 s. Count in `touch: baseline reset after charging/backlight switch` log lines |
++| Reaction | TAP: `surprised`, idle after 1.2 s. STROKE: `embarrassed` + servo wobble, idle 1.5 s after the last movement |
++
++The screen is woken (`HandleScreenActivity`) only by a confirmed TAP/STROKE while touch is enabled, so a stuck channel no longer keeps the display on. With touch disabled (`touch/enabled` = false, the default) the poll and the stuck-channel recovery still run — `get_touch_state` stays useful for diagnostics — but nothing is reported, no reaction is shown and the screen-off timer is untouched.
++
++`STROKE` `duration_ms` is the length of the press in which the finger moved (it used to be the hold time).
++
++### Touch guidance for hardware testing
++
++- The touch sensor is the **Si12T on the head top** (not the LCD screen FT6336)
++- Capacitive — use finger pad, not fingernail
++- STROKE needs the finger to slide from one zone to another (front ↔ back, or one zone over). Resting a hand on the head does nothing by design
++- Space consecutive tests at least 1 second apart
++- Always include an untouched soak (10 min on USB, 10 min on battery only): TAP/STROKE must stay at 0
++- `get_touch_state` also returns `masked` (bit mask of channels dropped as stuck), `recalibrations`, `enabled` and `boot_grace`
++
++### Wobble behavior (post PR #176 fix)
++
++`ServoWobbleStepAdvance()` drives 4 yaw steps: `-A → +A → -A → 0` (A=20°). **Pitch is held at `pitch_motion_.current_deg`** (PR #176 fix). Prior to this fix, `target_pitch = 0` was hardcoded, driving pitch toward the end-stop.
++
++Wobble is **staged** in `StartServoWobble()` (sets flags under `motion_mutex_`) and **executed** in `ServoTaskMain` tick — this avoids races between the touch poll callback (`ESP_TIMER_TASK`) and the servo motion task.
++
++## 3. WebSocket lifecycle pitfalls
++
++### Listening-state touch triggers WS disconnect
++
++In `application.cc`, a touch during `kDeviceStateListening` calls `CloseAudioChannel()` → `websocket_.reset()`, disconnecting the WebSocket. This is problematic for MCP control use cases where the WS should remain open. PR #136 addresses this.
++
++### Boot-time WS auto-connect
++
++`OpenAudioChannel()` is only triggered by user interaction (touch, wake word). Boot does NOT auto-connect. PR #197 adds a boot-time WS auto-connect path.
++
++### LCD display initial state
++
++The avatar is **not shown at boot** — it only appears after a `set_avatar(<face>)` call. Default post-boot/reconnect state is a blank screen. This is tracked as Issue #77 (enhancement: auto-show idle avatar on connect).
++
++## 3.5. Layer architecture (xiaozhi standard vs stackchan overrides)
++
++The stackchan board (`class StackChanBoard : public WifiBoard`, `stackchan.cc:499`) mixes custom implementations with xiaozhi standard passthrough:
++
++### Layer override / passthrough mapping
++
++| Layer | xiaozhi standard | stackchan behavior | Effect |
++|---|---|---|---|
++| Display backend | `Board::GetDisplay()` | Override → `SpiLcdDisplay` (ILI9342 320x240) | Standard LVGL rendering |
++| Status bar | `SetStatus(...)` | Passthrough | Chinese status text, hidden by avatar when active |
++| Emotion icon | `SetEmotion(...)` | Passthrough | Hidden by avatar when active |
++| **Avatar (custom)** | N/A | `avatar_img_` LVGL image, foreground, 320x240 | Covers all standard UI when active |
++| **LED** | `GetLed()` → `NoLed` | No override → NoLed passthrough | **LED does not reflect state** |
++| **Mouth animation (custom)** | N/A | `OnTtsStart/Stop` → lip-sync | Active during speaking only |
++| **Touch reactive face (custom)** | N/A | `TouchPollTick` → surprised/embarrassed | 1.2-1.5 second face change on TAP / STROKE |
++| Backlight | `GetBacklight()` → `nullptr` | Override → `CustomBacklight(pmic_)` | Auto-dim via PowerSaveLevel |
++| Camera | `GetCamera()` → `nullptr` | Override → `camera_` | MCP `take_photo` |
++| Audio codec | `GetAudioCodec()` → `nullptr` | Override → AW88298 + ES7210 | TTS + mic |
++
++### State observation guide
++
++| State | Deterministic observation | NOT reliable |
++|---|---|---|
++| idle / listening | MCP `get_device_status` state field, serial log | LCD avatar (no auto-switch), LED (NoLed) |
++| speaking | Serial log `tts.start`/`tts.stop`, mouth animation | LED |
++| touch reaction | LCD avatar (surprised/embarrassed), serial `touch event:` | LED, MCP state (unchanged) |
++| WS connection | Serial log `WS connected/disconnected`, gateway `/health` | Avatar-covered LCD status |
++
++**Central rule**: deterministic state observation uses **MCP `get_device_status` + serial monitor log**. LCD and LED are supplementary only.
++
++### Placeholder avatar ("Chinese face" symptom)
++
++If `avatar_images.local.cc` was not generated before build, the placeholder (1x1 black pixel) is used. The avatar layer renders as 2x2 pixels, exposing the xiaozhi default Chinese UI underneath. Fix:
++
++```bash
++cd firmware
++python scripts/avatar_convert/convert_avatars.py
++rm -rf build releases/*.zip
++# rebuild and reflash
++```
++
++The `sanity_check.sh` Step 7 detects this before flash.
++
++## 4. License boundary (GPL-3.0 vs MIT)
++
++See `CONTRIBUTING.md` for the full public specification. This section covers the operational check procedure.
++
++### GPL-3.0 files (8, SCServo_lib)
++
++```
++firmware/main/boards/stackchan/INST.h
++firmware/main/boards/stackchan/SCS.cc
++firmware/main/boards/stackchan/SCS.h
++firmware/main/boards/stackchan/SCSCL.cc
++firmware/main/boards/stackchan/SCSCL.h
++firmware/main/boards/stackchan/SCSerial.cc
++firmware/main/boards/stackchan/SCSerial.h
++firmware/main/boards/stackchan/SCServo.h
++```
++
++### Pre-edit check
++
++```bash
++# Verify license headers present
++grep -nE 'GPL-3.0|GNU General Public License' firmware/main/boards/stackchan/*.{cc,h} | head -20
++
++# Check if target file is GPL or MIT
++grep -l 'GPL-3.0\|GNU General' firmware/main/boards/stackchan/<target-file>
++```
++
++### Rules
++
++- **Never remove GPL headers** from the 8 files
++- **Never include MIT code from GPL files** (reverse-direction include risks viral effect)
++- **No new GPL code** — new servo control code uses the MIT `feetech_scs` component
++- Phase A (PR #83): canonical build uses MIT path by default, GPL is opt-in fallback
++- Phase B (Issue #144, pending): remove SCServo_lib 8 files entirely
++
++### Gateway boundary
++
++`gateway/` (Python, MIT) communicates via WebSocket — a separate process with no GPL contamination risk.
++
++## 5. stack-chan project attribution
++
++See `README.md` `## Trademarks` for the public specification. This section covers the check procedure.
++
++### Canonical credits
++
++| Item | Value |
++|---|---|
++| **Creator** | Shinya Ishikawa, 2021 |
++| **Official org** | `stack-chan/stack-chan` (Apache-2.0) |
++| **Trademark** | "StackChan" / "スタックチャン" = registered trademark of Shinya Ishikawa (defensive registration for OSS protection) |
++| **Arduino servo lib** | `stack-chan/stackchan-arduino` (MIT, maintainer: Takao Akaki / mongonta0716) |
++
++### Common misspellings to avoid
++
++- ~~`mongonta0716/stack-chan`~~ → use `stack-chan/stack-chan` (org, not personal fork)
++- ~~`mongonta555`~~ → `mongonta0716`
++- ~~タカヲ~~ → **タカオ** (Takao)
++
++### Pre-commit check
++
++```bash
++# Personal fork link should not appear (exclude the -arduino repo)
++grep -n 'mongonta0716/stack-chan' <file> | grep -v 'stackchan-arduino'
++grep -nE 'タカヲ|mongonta555' <file>
++
++# Trademarks section sanity
++grep -A 3 '^## Trademarks' README.md
++grep -A 3 '^## 商標' README.ja.md
++```
++
++## 6. Board-specific failure patterns
++
++For general failures (build/NVS/WS/sleep), see `firmware/AGENTS.md`. These are servo/touch/WS-lifecycle specific:
++
++| Symptom | Cause | Fix |
++|---|---|---|
++| Boot `ReadPos: yaw_raw=-1 pitch_raw=-1` | SCS0009 wake-up latency | ReadPos retry (PR #139). See § 1 |
++| End-stop walk during boot climb | `current_deg = 0` without ReadPos fallback | ReadPos fallback seed (PR #139). See § 1 |
++| "snap" sound + bus hang at boot | PMIC OFF/ON without snap-suppress | Hand-hold at 45° during boot. See § 1 |
++| Touch triggers WS disconnect | `CloseAudioChannel()` in listening state | PR #136 (pending). See § 3 |
++| Quick tap doesn't trigger wobble | TAP (< 400 ms) vs STROKE (≥ 400 ms) | Hold ≥ 0.4s. See § 2 |
++| Wobble drives pitch to end-stop | `target_pitch = 0` hardcode bug | Fixed in PR #176. See § 2 |
++| Chinese UI visible instead of avatar | `avatar_images.local.cc` not generated | Run `convert_avatars.py`, rebuild. See § 3.5 |
++| `smooth_ui_toolkit` component missing | Submodule not initialized in worktree | `git submodule update --init firmware/components/smooth_ui_toolkit` |
+diff --git a/main/boards/m5stack-core-s3/m5stack_core_s3.cc b/main/boards/m5stack-core-s3/m5stack_core_s3.cc
+index 2a06312..0ac8744 100644
+--- a/main/boards/m5stack-core-s3/m5stack_core_s3.cc
++++ b/main/boards/m5stack-core-s3/m5stack_core_s3.cc
+@@ -8,8 +8,12 @@
+ #include "axp2101.h"
+ #include "mcp_server.h"
+ #include "notify_http_server.h"
++#include "settings.h"
++
++#include <string>
+ 
+ #include <esp_log.h>
++#include <esp_system.h>
+ #include <esp_heap_caps.h>
+ #include <driver/i2c_master.h>
+ #include <esp_lcd_panel_io.h>
+@@ -1082,6 +1086,33 @@ public:
+         if (servo_) servo_->Tilt();
+     }
+ 
++    // 给 MCP 用：单独叠加一层特效，不换表情。返回 false 表示名字不认识或
++    // avatar 还没初始化完（启动头几秒）。
++    bool SetOverlayByName(const char* name) {
++        if (!name || !avatar_.IsReady()) return false;
++        shizhou_avatar::Overlay o;
++        if      (!strcmp(name, "heart_eyes"))    o.heart_eyes = true;
++        else if (!strcmp(name, "tear"))          o.tear = true;
++        else if (!strcmp(name, "kiss_heart"))    o.kiss_heart = true;
++        else if (!strcmp(name, "cheek_blush"))   o.cheek_blush = true;
++        else if (!strcmp(name, "cool_glasses"))  o.cool_glasses = true;
++        else if (!strcmp(name, "excl_mark"))     o.excl_mark = true;
++        else if (!strcmp(name, "think_bubble"))  o.think_bubble = true;
++        else if (!strcmp(name, "star_burst"))    o.star_burst = true;
++        else if (!strcmp(name, "wave_squiggle")) o.wave_squiggle = true;
++        else if (!strcmp(name, "drool"))         o.drool = true;
++        else if (!strcmp(name, "laugh_lines"))   o.laugh_lines = true;
++        else if (!strcmp(name, "question_mark")) o.question_mark = true;
++        else if (!strcmp(name, "zzz"))           o.zzz = true;
++        else if (!strcmp(name, "none"))          { /* 全 false = 清掉 */ }
++        else return false;
++        DisplayLockGuard lock(this);
++        avatar_.SetOverlay(o);
++        SetActiveLocked(true);
++        BumpIdleTimerLocked();
++        return true;
++    }
++
+     void SetEmotion(const char* emotion) override {
+         SpiLcdDisplay::SetEmotion(emotion);
+         DisplayLockGuard lock(this);
+@@ -1354,6 +1385,10 @@ private:
+     // ---- PY32 持久 I2C 设备句柄（控 LED + 其他扩展）----
+     i2c_master_dev_handle_t py32_dev_ = nullptr;
+     bool led_manual_ = false;
++    // ---- 12 灯内置动画（self.led.pattern）----
++    esp_timer_handle_t led_pattern_timer_ = nullptr;
++    std::string led_pattern_;
++    int led_pattern_frame_ = 0;
+     // ---- BMI270 (IMU) ----
+     i2c_master_dev_handle_t bmi_i2c_dev_ = nullptr;
+     struct bmi2_dev bmi_dev_storage_ = {};
+@@ -1580,6 +1615,81 @@ private:
+         return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
+     }
+ 
++    // ── 12 灯内置动画 ────────────────────────────────────────────────
++    // 全部复用已有的 Py32SetLedFrame()（一次 I2C burst 刷 12 颗），不引入
++    // 新驱动；动画跑在 ESP timer task 上，不占主循环。
++    static void LedPatternTimerCb(void* arg) {
++        static_cast<M5StackCoreS3Board*>(arg)->LedPatternTick();
++    }
++
++    void LedPatternTick() {
++        if (!py32_dev_ || led_pattern_.empty()) return;
++        uint16_t frame[12] = {};
++        int f = led_pattern_frame_++;
++        if (led_pattern_ == "rainbow") {
++            static const uint8_t palette[12][3] = {
++                {255,  40,  40}, {255, 110,  20}, {255, 180,   0}, {210, 230,   0},
++                {120, 240,  30}, { 20, 240, 110}, {  0, 220, 220}, { 30, 150, 255},
++                { 90,  90, 255}, {170,  60, 255}, {240,  50, 190}, {255,  60, 110},
++            };
++            for (int i = 0; i < 12; i++) {
++                const uint8_t* c = palette[(i + f) % 12];
++                frame[i] = Rgb888To565(c[0], c[1], c[2]);
++            }
++        } else if (led_pattern_ == "breath") {
++            // 三角波，避免浮点
++            int level = abs((f % 40) - 20) * 255 / 20;
++            uint16_t c = Rgb888To565(level, level, level);
++            for (int i = 0; i < 12; i++) frame[i] = c;
++        } else if (led_pattern_ == "chase") {
++            for (int i = 0; i < 12; i++) {
++                int d = (i - (f % 12) + 12) % 12;
++                uint8_t v = d == 0 ? 255 : (d == 1 ? 90 : (d == 2 ? 30 : 0));
++                frame[i] = Rgb888To565(v, v / 2, 0);
++            }
++        } else {
++            return;
++        }
++        Py32SetLedFrame(frame, 12);
++    }
++
++    void StopLedPattern() {
++        if (led_pattern_timer_ != nullptr) {
++            esp_timer_stop(led_pattern_timer_);
++        }
++        led_pattern_.clear();
++    }
++
++    bool StartLedPattern(const std::string& name, int speed_ms) {
++        if (name == "off") {
++            StopLedPattern();
++            return true;
++        }
++        if (name != "rainbow" && name != "breath" && name != "chase") {
++            return false;
++        }
++        if (speed_ms < 40) speed_ms = 40;
++        if (speed_ms > 2000) speed_ms = 2000;
++        if (led_pattern_timer_ == nullptr) {
++            esp_timer_create_args_t args = {};
++            args.callback = &M5StackCoreS3Board::LedPatternTimerCb;
++            args.arg = this;
++            args.dispatch_method = ESP_TIMER_TASK;
++            args.name = "led_pattern";
++            args.skip_unhandled_events = true;
++            if (esp_timer_create(&args, &led_pattern_timer_) != ESP_OK) {
++                led_pattern_timer_ = nullptr;
++                return false;
++            }
++        } else {
++            esp_timer_stop(led_pattern_timer_);
++        }
++        led_pattern_ = name;
++        led_pattern_frame_ = 0;
++        led_manual_ = true;  // 暂停情绪灯联动，别把动画覆盖掉
++        return esp_timer_start_periodic(led_pattern_timer_, (uint64_t)speed_ms * 1000) == ESP_OK;
++    }
++
+     void UpdateLedsFromEmotion(const char* emotion) {
+         if (!py32_dev_) return;
+         if (led_manual_) return;
+@@ -1731,6 +1841,7 @@ private:
+                 uint8_t r = props["r"].value<int>();
+                 uint8_t g = props["g"].value<int>();
+                 uint8_t b = props["b"].value<int>();
++                StopLedPattern();
+                 uint16_t color = Rgb888To565(r, g, b);
+                 uint16_t colors[12];
+                 for (int i = 0; i < 12; i++) colors[i] = color;
+@@ -1743,6 +1854,7 @@ private:
+             "Turn off the LED ring light.",
+             PropertyList(),
+             [this](const PropertyList&) -> ReturnValue {
++                StopLedPattern();
+                 uint16_t off[12] = {};
+                 Py32SetLedFrame(off, 12);
+                 led_manual_ = true;
+@@ -1753,10 +1865,89 @@ private:
+             "Set LED back to automatic emotion-based color mode.",
+             PropertyList(),
+             [this](const PropertyList&) -> ReturnValue {
++                StopLedPattern();
+                 led_manual_ = false;
+                 ESP_LOGI(TAG, "MCP LED auto mode");
+                 return true;
+             });
++
++        // ── 功能整合新增 ──────────────────────────────────────────────
++        // 12 颗灯逐颗上色：逗号分隔的 #RRGGBB 或 0xRRGGBB，最多 12 个；
++        // 少于 12 个时剩下的灯复用最后一个颜色。brightness 0-100 统一缩放。
++        mcp.AddTool("self.led.set_many",
++            "Set each of the 12 ring LEDs individually. 'colors' is a comma-separated "
++            "list of up to 12 hex colors (#RRGGBB or 0xRRGGBB); a shorter list repeats "
++            "the last color for the remaining LEDs. 'brightness' scales all of them (0-100).",
++            PropertyList({
++                Property("colors", kPropertyTypeString),
++                Property("brightness", kPropertyTypeInteger, 100, 0, 100),
++            }),
++            [this](const PropertyList& props) -> ReturnValue {
++                if (!py32_dev_) return std::string("LED controller not available");
++                auto spec = props["colors"].value<std::string>();
++                int brightness = props["brightness"].value<int>();
++                uint16_t colors[12] = {};
++                int count = 0;
++                size_t pos = 0;
++                while (count < 12 && pos < spec.size()) {
++                    size_t end = spec.find(',', pos);
++                    if (end == std::string::npos) end = spec.size();
++                    std::string token = spec.substr(pos, end - pos);
++                    // 去掉空白和前缀
++                    size_t first = token.find_first_not_of(" \t#");
++                    if (first == std::string::npos) { pos = end + 1; continue; }
++                    std::string hex = token.substr(first);
++                    if (hex.rfind("0x", 0) == 0 || hex.rfind("0X", 0) == 0) hex = hex.substr(2);
++                    unsigned long rgb = strtoul(hex.c_str(), nullptr, 16);
++                    uint8_t r = (rgb >> 16) & 0xFF;
++                    uint8_t g = (rgb >> 8) & 0xFF;
++                    uint8_t b = rgb & 0xFF;
++                    r = (uint8_t)(r * brightness / 100);
++                    g = (uint8_t)(g * brightness / 100);
++                    b = (uint8_t)(b * brightness / 100);
++                    colors[count++] = Rgb888To565(r, g, b);
++                    if (end == spec.size()) break;
++                    pos = end + 1;
++                }
++                if (count == 0) return std::string("no valid colors");
++                for (int i = count; i < 12; i++) colors[i] = colors[count - 1];
++                StopLedPattern();
++                Py32SetLedFrame(colors, 12);
++                led_manual_ = true;
++                ESP_LOGI(TAG, "MCP LED set_many: %d colors @ %d%%", count, brightness);
++                return true;
++            });
++
++        // gateway 兼容别名（stackchan-mcp 的 clear_leds 映射到 self.led.clear）
++        mcp.AddTool("self.led.clear",
++            "Turn off all 12 ring LEDs. Alias of self.led.turn_off.",
++            PropertyList(),
++            [this](const PropertyList&) -> ReturnValue {
++                StopLedPattern();
++                uint16_t off[12] = {};
++                Py32SetLedFrame(off, 12);
++                led_manual_ = true;
++                return true;
++            });
++
++        mcp.AddTool("self.led.pattern",
++            "Run a built-in animation on the 12-LED ring. "
++            "name: rainbow (rotating rainbow), breath (white breathing), "
++            "chase (orange running light), off (stop animation). "
++            "speed_ms is the frame period (40-2000, default 120).",
++            PropertyList({
++                Property("name", kPropertyTypeString),
++                Property("speed_ms", kPropertyTypeInteger, 120, 40, 2000),
++            }),
++            [this](const PropertyList& props) -> ReturnValue {
++                auto name = props["name"].value<std::string>();
++                int speed = props["speed_ms"].value<int>();
++                if (!StartLedPattern(name, speed)) {
++                    return std::string("unknown pattern: ") + name;
++                }
++                ESP_LOGI(TAG, "MCP LED pattern: %s @ %dms", name.c_str(), speed);
++                return true;
++            });
+     }
+ 
+     void RegisterServoMcpTools() {
+@@ -1790,6 +1981,7 @@ private:
+                 Property("pitch", kPropertyTypeInteger, 5, 60),
+             }),
+             [this, move_with_pause](const PropertyList& props) -> ReturnValue {
++                if (!servo_ok_) return std::string("servo unavailable");
+                 int yaw = props["yaw"].value<int>();
+                 int pitch = props["pitch"].value<int>();
+                 move_with_pause(yaw, pitch, 800);
+@@ -1803,6 +1995,7 @@ private:
+             "'回正', 'look at me', 'face front', etc.",
+             PropertyList(),
+             [this](const PropertyList&) -> ReturnValue {
++                if (!servo_ok_) return std::string("servo unavailable");
+                 // 先锁着移动到 center
+                 face_tracker_.SetManualLock(true);
+                 face_tracker_.Pause(false);
+@@ -1829,6 +2022,7 @@ private:
+             "Use when user says nod, agree, say yes, greet, etc.",
+             PropertyList(),
+             [this](const PropertyList&) -> ReturnValue {
++                if (!servo_ok_) return std::string("servo unavailable");
+                 servo_.Nod();
+                 ESP_LOGI(TAG, "MCP head nod");
+                 return true;
+@@ -1839,6 +2033,7 @@ private:
+             "Use when user says shake head, disagree, refuse, say no, etc.",
+             PropertyList(),
+             [this](const PropertyList&) -> ReturnValue {
++                if (!servo_ok_) return std::string("servo unavailable");
+                 servo_.Shake();
+                 ESP_LOGI(TAG, "MCP head shake");
+                 return true;
+@@ -1908,6 +2103,129 @@ private:
+             });
+     }
+ 
++    // ── 功能整合：把板卡里已有但没暴露的能力补成 MCP 工具 ──────────────
++    // 原则：不新增硬件依赖、不替换现有板卡实现，只做"盘活"。
++    void RegisterExtraMcpTools() {
++        auto& mcp = McpServer::GetInstance();
++
++        mcp.AddTool("self.face.list",
++            "List all facial expression names this robot can show, plus the available "
++            "overlay effect names. Call this before self.face.expression / self.face.overlay "
++            "when you are unsure which names are valid.",
++            PropertyList(),
++            [](const PropertyList&) -> ReturnValue {
++                return std::string(
++                    "expressions: neutral,happy,laughing,funny,sad,crying,angry,loving,"
++                    "embarrassed,surprised,shocked,thinking,winking,cool,relaxed,"
++                    "delicious,kissy,confident,sleepy,silly,confused; "
++                    "overlays: none,heart_eyes,tear,kiss_heart,cheek_blush,cool_glasses,"
++                    "excl_mark,think_bubble,star_burst,wave_squiggle,drool,laugh_lines,"
++                    "question_mark,zzz");
++            });
++
++        mcp.AddTool("self.face.overlay",
++            "Overlay a small effect on the current face without changing the expression: "
++            "heart_eyes, tear, kiss_heart, cheek_blush, cool_glasses, excl_mark, "
++            "think_bubble, star_burst, wave_squiggle, drool, laugh_lines, "
++            "question_mark, zzz, or none to clear. Returns false if the name is unknown.",
++            PropertyList({
++                Property("name", kPropertyTypeString)
++            }),
++            [this](const PropertyList& props) -> ReturnValue {
++                auto name = props["name"].value<std::string>();
++                auto* disp = static_cast<M5StackAvatarDisplay*>(display_);
++                if (disp == nullptr) return false;
++                return disp->SetOverlayByName(name.c_str());
++            });
++
++        mcp.AddTool("self.head.get_angles",
++            "Read the head's last commanded yaw and pitch in degrees.",
++            PropertyList(),
++            [this](const PropertyList&) -> ReturnValue {
++                return std::string("{\"yaw\":") + std::to_string(servo_.GetCurrentYaw()) +
++                       ",\"pitch\":" + std::to_string(servo_.GetCurrentPitch()) + "}";
++            });
++
++        mcp.AddTool("self.head.tilt",
++            "Cutely tilt the head to one side (the same gesture as being petted). "
++            "Use for greetings, affection, or playful reactions.",
++            PropertyList(),
++            [this](const PropertyList&) -> ReturnValue {
++                if (!servo_ok_) return std::string("servo unavailable");
++                servo_.Tilt();
++                return true;
++            });
++
++        // 不重编译切本地 gateway / 切回小智云。
++        // WebsocketProtocol::OpenAudioChannel() 读 namespace "websocket" 的
++        // url / token / version；Ota 读 namespace "wifi" 的 ota_url。
++        mcp.AddTool("self.gateway_config.get",
++            "Read the current voice/WebSocket endpoint configuration stored in NVS "
++            "(websocket url, whether a token is set, protocol version, ota url). "
++            "Token value is never returned.",
++            PropertyList(),
++            [](const PropertyList&) -> ReturnValue {
++                Settings ws("websocket", false);
++                Settings wifi("wifi", false);
++                std::string url = ws.GetString("url");
++                return std::string("{\"websocket_url\":\"") + url +
++                       "\",\"websocket_token_set\":" +
++                       (ws.GetString("token").empty() ? "false" : "true") +
++                       ",\"websocket_version\":" + std::to_string(ws.GetInt("version", 0)) +
++                       ",\"ota_url\":\"" + wifi.GetString("ota_url") +
++                       "\",\"mode\":\"" + (url.empty() ? "xiaozhi-cloud" : "custom-ws") + "\"}";
++            });
++
++        mcp.AddTool("self.gateway_config.set",
++            "Switch the robot between the Xiaozhi cloud and a self-hosted WebSocket "
++            "gateway by writing NVS keys. Leave url empty (or set clear=true) to go back "
++            "to the Xiaozhi cloud. Changes take effect after reboot; set restart=true "
++            "to reboot immediately.",
++            PropertyList({
++                Property("url", kPropertyTypeString, std::string("")),
++                Property("token", kPropertyTypeString, std::string("")),
++                Property("ota_url", kPropertyTypeString, std::string("")),
++                Property("version", kPropertyTypeInteger, 0, 0, 3),
++                Property("clear", kPropertyTypeBoolean, false),
++                Property("restart", kPropertyTypeBoolean, false),
++            }),
++            [](const PropertyList& props) -> ReturnValue {
++                std::string url = props["url"].value<std::string>();
++                std::string token = props["token"].value<std::string>();
++                std::string ota = props["ota_url"].value<std::string>();
++                int version = props["version"].value<int>();
++                bool clear = props["clear"].value<bool>();
++                bool restart = props["restart"].value<bool>();
++                {
++                    Settings ws("websocket", true);
++                    if (clear) {
++                        ws.EraseKey("url");
++                        ws.EraseKey("token");
++                        ws.SetInt("version", 0);  // 保证 nvs_commit
++                    } else {
++                        if (!url.empty()) ws.SetString("url", url);
++                        if (!token.empty()) ws.SetString("token", token);
++                        ws.SetInt("version", version);
++                    }
++                }
++                if (!ota.empty()) {
++                    Settings wifi("wifi", true);
++                    wifi.SetString("ota_url", ota);
++                }
++                ESP_LOGI(TAG, "gateway config: clear=%d url=%s restart=%d", clear, url.c_str(), restart);
++                if (restart) {
++                    esp_timer_create_args_t args = {};
++                    args.callback = [](void*) { esp_restart(); };
++                    args.name = "mcp_restart";
++                    esp_timer_handle_t timer = nullptr;
++                    if (esp_timer_create(&args, &timer) == ESP_OK) {
++                        esp_timer_start_once(timer, 800000);
++                    }
++                }
++                return true;
++            });
++    }
++
+     void InitializePowerSaveTimer() {
+         power_save_timer_ = new PowerSaveTimer(-1, -1, -1);
+         power_save_timer_->OnEnterSleepMode([this]() {
+@@ -2347,11 +2665,15 @@ public:
+             vTaskDelay(pdMS_TO_TICKS(200));
+             servo_ok_ = servo_.Begin();
+             InitializePy32LedDevice();
+-            RegisterLedMcpTools();
+-            RegisterExpressionMcpTool();
+-            RegisterServoMcpTools();
+-            RegisterNotifyMcpTools();  // Claude Code 提醒工具（HTTP + LLM 双入口）
+         }
++        // 工具注册不再挂在 PY32 是否存在上：旧版一旦 PY32 探测失败，
++        // 连表情 / notify / 状态这些跟 PY32 无关的工具也全部消失。
++        // LED 与 servo 工具内部各自判空/判 servo_ok_，缺硬件时安全返回。
++        RegisterLedMcpTools();
++        RegisterExpressionMcpTool();
++        RegisterServoMcpTools();
++        RegisterNotifyMcpTools();
++        RegisterExtraMcpTools();
+ 
+         InitializeSpi();
+         InitializeIli9342Display();
+diff --git a/main/boards/m5stack-core-s3/power_save_gate.h b/main/boards/m5stack-core-s3/power_save_gate.h
+new file mode 100644
+index 0000000..ca26d03
+--- /dev/null
++++ b/main/boards/m5stack-core-s3/power_save_gate.h
+@@ -0,0 +1,45 @@
++// Decides when the automatic dim / power-off timer (PowerSaveTimer) runs.
++//
++// Header-only and free of ESP-IDF dependencies so the decision can be
++// covered by host tests (firmware/host_test/test_power_save_gate.cc).
++#pragma once
++
++namespace stackchan::power {
++
++// The timer runs on battery (discharging). On external power it runs only
++// when the owner opted in with external_power_auto_off.
++inline bool ShouldRunPowerSaveTimer(bool discharging,
++                                    bool external_power_auto_off) {
++    return discharging || external_power_auto_off;
++}
++
++// Remembers the timer state that was last applied so the board only calls
++// PowerSaveTimer::SetEnabled() when the desired state changes. It must be
++// constructed with the state the timer actually starts in; a mismatch here
++// is what left the timer running on USB power when booting without a
++// battery transition.
++class PowerSaveGate {
++public:
++    explicit PowerSaveGate(bool timer_enabled) : applied_(timer_enabled) {}
++
++    // Returns true and stores the new state in *enable when the timer must
++    // be switched; returns false when it is already in the desired state.
++    bool Update(bool discharging, bool external_power_auto_off,
++                bool* enable) {
++        bool desired =
++            ShouldRunPowerSaveTimer(discharging, external_power_auto_off);
++        if (desired == applied_) {
++            return false;
++        }
++        applied_ = desired;
++        *enable = desired;
++        return true;
++    }
++
++    bool applied() const { return applied_; }
++
++private:
++    bool applied_;
++};
++
++}  // namespace stackchan::power
+diff --git a/main/boards/m5stack-core-s3/touch_gesture.h b/main/boards/m5stack-core-s3/touch_gesture.h
+new file mode 100644
+index 0000000..de0b59c
+--- /dev/null
++++ b/main/boards/m5stack-core-s3/touch_gesture.h
+@@ -0,0 +1,368 @@
++#pragma once
++
++// Head-touch gesture classifier for the Si12T (CH1..CH3 = front/middle/back).
++// Pure C++ (no ESP-IDF headers) so it can be unit-tested on the host.
++//
++// Feed one sample every TouchGestureConfig::tick_ms with the 0..3 level of
++// each channel. The tracker:
++//   - ignores everything for `boot_grace_ms` after Begin() (Si12T fast
++//     calibration window) and keeps channels that are already "touched" at the
++//     end of the window unusable until they read 0 for `unmask_zero_ms`;
++//   - watches for channels that stay non-zero for `stuck_ms`: those are
++//     reported in `recal_mask` (caller resets the chip reference), dropped
++//     from the decision, and re-admitted after `unmask_zero_ms` of zeros;
++//   - classifies one press (OR of usable channels) as
++//       STROKE: the finger left a zone it started on AND reached a zone it did
++//               not start on (moved across zones),
++//               OR the level-weighted centre of the touched channels shifted by
++//               `centroid_move_ch` (a wide, fast finger never fully leaves its
++//               start zone, so the zone test alone misses it); either way
++//               only once some channel reached `event_min_level` (H, 3), as
++//               two-channel M bursts on an untouched head also shift the centre;
++//       TAP:    no movement, `tap_min_ms`..`tap_max_ms` hold, and some
++//               channel reached `event_min_level` (H, 3). An untouched head
++//               (screen on or off) now and then reads L/M on one or all
++//               channels for up to ~400 ms, sometimes every ~4 s for minutes,
++//               and never reaches H; 40 of 43 finger taps recorded on the
++//               device reached H on at least one tick, so L/M-only presses
++//               are never a TAP (a very light tap peaking at M is lost).
++//               A press whose first sample lights all three zones at once is
++//               a TAP only if at least `all_zone_start_min_high` of them are
++//               at H on that sample: the untouched-head bursts rise on every
++//               zone together with at most one at H (0x15, 0x29, 0x2A, 0x3A),
++//               while the real taps that started on all zones had two at H
++//               (0x1F, 0x2F, 0x3D);
++//       none:   stationary hold longer than `tap_max_ms` (e.g. a stuck
++//               channel or a resting hand), or a press that stayed below H.
++//   - NotifySettle() is called when charging or the backlight switches. The
++//     capacitive readings wobble for up to ~1 s afterwards, but only as a
++//     stationary blip on a single channel; a finger sliding across zones is
++//     never mistaken for one. So for `settle_ms`:
++//       * a press that is already on keeps being tracked as usual;
++//       * a press that starts inside the window may only end as a STROKE (it
++//         moved across zones); a stationary one is dropped, never a TAP;
++//     and when the window ends the caller is asked to reset the chip reference
++//     of all channels (`recal_mask`). That reset waits until a finger that is
++//     really on the pad (started before the switch, or already sliding) lets
++//     go; channels that read non-zero at the reset stay masked until they read
++//     0 for `settle_unmask_zero_ms`.
++
++#include <cstdint>
++
++namespace stackchan {
++namespace touch {
++
++struct TouchGestureConfig {
++    uint32_t tick_ms = 50;
++    uint32_t boot_grace_ms = 10000;
++    uint32_t stuck_ms = 15000;
++    uint32_t unmask_zero_ms = 1000;
++    uint32_t release_confirm_ticks = 3;     // 150 ms of zeros end a press
++    uint32_t move_zone_confirm_ticks = 2;   // new zone must persist (100 ms)
++    uint32_t move_release_confirm_ticks = 2;  // start zone must stay off (100 ms)
++    uint32_t tap_min_ms = 100;              // two ticks; a one-tick spike is never a tap
++    uint32_t tap_max_ms = 500;
++    uint8_t event_min_level = 3;            // a TAP or STROKE must reach this level (H) on some channel
++    uint8_t all_zone_start_min_high = 2;    // a TAP that starts on all 3 zones needs this many at H then
++    uint32_t settle_ms = 1000;              // tap-proof window after a power/backlight switch
++    uint32_t settle_unmask_zero_ms = 300;   // zeros needed to unmask after that reset
++    uint32_t cooldown_ms = 300;
++    float centroid_move_ch = 1.0f;          // level-weighted position shift that also counts as sliding
++    uint8_t centroid_min_level = 2;         // only ticks whose strongest channel is M or above
++};
++
++enum class TouchGestureEvent : uint8_t {
++    NONE = 0,
++    TAP,
++    STROKE,
++};
++
++struct TouchGestureOutput {
++    TouchGestureEvent event = TouchGestureEvent::NONE;  // emitted on release
++    uint32_t duration_ms = 0;       // TAP: hold length. STROKE: press length.
++    bool moved_now = false;         // finger movement just confirmed (STROKE in progress)
++    bool ended_without_event = false;  // a press ended and was not a TAP/STROKE
++    uint8_t recal_mask = 0;         // bit i = CH(i+1): reset the chip reference now
++    uint8_t start_zones = 0;        // zones touched at press start (valid with event)
++    uint8_t peak_level = 0;         // highest level seen on a usable channel in the press
++    bool dropped_weak = false;      // a tap-length press never reached event_min_level (log it)
++    bool settle_reset = false;      // recal_mask is for the post-switch reference reset
++};
++
++class TouchGestureTracker {
++public:
++    static constexpr int kChannels = 3;
++
++    explicit TouchGestureTracker(const TouchGestureConfig& config = TouchGestureConfig())
++        : cfg_(config) {}
++
++    // Restart (e.g. after the chip was re-initialised). Starts the boot grace.
++    void Begin(uint32_t now_ms) {
++        const TouchGestureConfig cfg = cfg_;
++        *this = TouchGestureTracker(cfg);
++        begin_ms_ = now_ms;
++        started_ = true;
++    }
++
++    uint8_t masked_channels() const { return masked_; }
++    uint32_t recalibrations() const { return recalibrations_; }
++    uint32_t settle_resets() const { return settle_resets_; }
++    bool in_settle() const { return settle_active_; }
++
++    // Charging / backlight just changed: power rails move and the capacitive
++    // readings wobble (see the header comment for what is and is not accepted).
++    void NotifySettle(uint32_t now_ms) {
++        if (!started_ || in_grace_) return;
++        settle_active_ = true;
++        settle_until_ms_ = now_ms + cfg_.settle_ms;
++    }
++    bool in_boot_grace() const { return in_grace_; }
++    bool pressed() const { return pressed_; }
++
++    TouchGestureOutput Update(uint32_t now_ms, const uint8_t levels[kChannels]) {
++        TouchGestureOutput out;
++        if (!started_) {
++            Begin(now_ms);
++        }
++
++        uint8_t raw = 0;  // bit i: CH(i+1) reads non-zero
++        for (int i = 0; i < kChannels; i++) {
++            if (levels[i] != 0) raw |= static_cast<uint8_t>(1u << i);
++        }
++
++        if (in_grace_) {
++            if (now_ms - begin_ms_ < cfg_.boot_grace_ms) {
++                return out;
++            }
++            in_grace_ = false;
++            // Anything already touched when the window closes is a leftover of
++            // the boot calibration, not a finger we saw arrive.
++            masked_ = raw;
++            for (int i = 0; i < kChannels; i++) {
++                nonzero_ms_[i] = 0;
++                zero_ms_[i] = 0;
++                unmask_need_ms_[i] = cfg_.unmask_zero_ms;
++            }
++            last_tick_ms_ = now_ms;
++        }
++
++        const uint32_t dt = last_tick_ms_ == 0 ? cfg_.tick_ms : (now_ms - last_tick_ms_);
++        last_tick_ms_ = now_ms;
++
++        const bool in_window = settle_active_ && now_ms < settle_until_ms_;
++        if (settle_active_ && !in_window &&
++            (!pressed_ || (press_in_settle_ && !moved_ &&
++                           now_ms - press_start_ms_ >= cfg_.tap_max_ms))) {
++            // Window over. A press that began inside it and has sat still for
++            // longer than any tap is a lingering blip; a real finger (began
++            // earlier, already sliding, or still young) is left alone and the
++            // reset happens once it lets go.
++            settle_active_ = false;
++            settle_resets_++;
++            pressed_ = false;
++            press_dirty_ = false;
++            moved_ = false;
++            zero_ticks_ = 0;
++            cooldown_valid_ = false;
++            const uint8_t fresh = static_cast<uint8_t>(raw & 0x07 & ~masked_);
++            masked_ |= fresh;
++            for (int i = 0; i < kChannels; i++) {
++                nonzero_ms_[i] = 0;
++                zero_ms_[i] = 0;
++                if (fresh & (1u << i)) unmask_need_ms_[i] = cfg_.settle_unmask_zero_ms;
++            }
++            out.recal_mask = 0x07;
++            out.settle_reset = true;
++            return out;
++        }
++
++        // ---- stuck watch / unmask -------------------------------------
++        for (int i = 0; i < kChannels; i++) {
++            const uint8_t bit = static_cast<uint8_t>(1u << i);
++            if (raw & bit) {
++                zero_ms_[i] = 0;
++                nonzero_ms_[i] += dt;
++                if (nonzero_ms_[i] >= cfg_.stuck_ms) {
++                    nonzero_ms_[i] = 0;
++                    masked_ |= bit;
++                    unmask_need_ms_[i] = cfg_.unmask_zero_ms;
++                    out.recal_mask |= bit;
++                    recalibrations_++;
++                    if (pressed_) press_dirty_ = true;
++                }
++            } else {
++                nonzero_ms_[i] = 0;
++                zero_ms_[i] += dt;
++                if ((masked_ & bit) && zero_ms_[i] >= unmask_need_ms_[i]) {
++                    masked_ &= static_cast<uint8_t>(~bit);
++                }
++            }
++        }
++
++        const uint8_t active = raw & static_cast<uint8_t>(~masked_) & 0x07;
++
++        // ---- press tracking ---------------------------------------------
++        if (!pressed_) {
++            if (active == 0) {
++                return out;
++            }
++            pressed_ = true;
++            press_start_ms_ = now_ms;
++            last_active_ms_ = now_ms;
++            start_zones_ = active;
++            press_in_settle_ = in_window;
++            {
++                int high = 0;
++                for (int i = 0; i < kChannels; i++) {
++                    if ((active & (1u << i)) && levels[i] >= 3) high++;
++                }
++                press_all_zones_weak_ = (active == 0x07 && high < cfg_.all_zone_start_min_high);
++            }
++            peak_level_ = 0;
++            for (int i = 0; i < kChannels; i++) {
++                if ((active & (1u << i)) && levels[i] > peak_level_) peak_level_ = levels[i];
++            }
++            seen_new_ = 0;
++            vacated_ = 0;
++            moved_ = false;
++            zero_ticks_ = 0;
++            cen_valid_ = false;
++            TrackCentroid(active, levels);
++            for (int i = 0; i < kChannels; i++) {
++                new_ticks_[i] = 0;
++                off_ticks_[i] = 0;
++            }
++            // A press that begins inside the cooldown is not ours to report.
++            press_dirty_ = (cooldown_valid_ && now_ms - cooldown_from_ms_ < cfg_.cooldown_ms);
++            return out;
++        }
++
++        if (active != 0) {
++            zero_ticks_ = 0;
++            last_active_ms_ = now_ms;
++        } else {
++            zero_ticks_++;
++        }
++
++        for (int i = 0; i < kChannels; i++) {
++            if ((active & (1u << i)) && levels[i] > peak_level_) peak_level_ = levels[i];
++        }
++
++        // Movement: left a start zone, reached a zone that was not a start zone.
++        // Only ticks with the pad still touched count, so lifting the finger
++        // off (every zone goes quiet) is never mistaken for sliding away.
++        for (int i = 0; active != 0 && i < kChannels; i++) {
++            const uint8_t bit = static_cast<uint8_t>(1u << i);
++            const bool on = (active & bit) != 0;
++            if (start_zones_ & bit) {
++                off_ticks_[i] = on ? 0 : off_ticks_[i] + 1;
++                if (off_ticks_[i] >= cfg_.move_release_confirm_ticks) vacated_ |= bit;
++            } else {
++                new_ticks_[i] = on ? new_ticks_[i] + 1 : 0;
++                if (new_ticks_[i] >= cfg_.move_zone_confirm_ticks) seen_new_ |= bit;
++            }
++        }
++        TrackCentroid(active, levels);
++        if (!moved_ && !press_dirty_ && peak_level_ >= cfg_.event_min_level &&
++            ((vacated_ != 0 && seen_new_ != 0) ||
++             (cen_valid_ && cen_max_ - cen_min_ >= cfg_.centroid_move_ch))) {
++            moved_ = true;
++            out.moved_now = true;
++        }
++
++        if (zero_ticks_ < cfg_.release_confirm_ticks) {
++            return out;
++        }
++
++        // ---- release ------------------------------------------------------
++        pressed_ = false;
++        const uint32_t duration = last_active_ms_ - press_start_ms_ + cfg_.tick_ms;
++        cooldown_valid_ = true;
++        cooldown_from_ms_ = last_active_ms_;
++        if (!press_dirty_) {
++            if (moved_) {
++                out.event = TouchGestureEvent::STROKE;
++                out.duration_ms = duration;
++                out.start_zones = start_zones_;
++            } else if (!press_in_settle_ && duration >= cfg_.tap_min_ms &&
++                       duration <= cfg_.tap_max_ms) {
++                if (peak_level_ >= cfg_.event_min_level && !press_all_zones_weak_) {
++                    out.event = TouchGestureEvent::TAP;
++                    out.duration_ms = duration;
++                    out.start_zones = start_zones_;
++                } else {
++                    out.dropped_weak = true;
++                }
++            }
++        }
++        out.peak_level = peak_level_;
++        // moved_now never fires without a matching STROKE unless the press was
++        // dirty, and dirty presses suppress movement.
++        if (out.event == TouchGestureEvent::NONE) {
++            out.ended_without_event = true;
++            out.duration_ms = duration;
++        }
++        press_dirty_ = false;
++        return out;
++    }
++
++private:
++    void TrackCentroid(uint8_t active, const uint8_t levels[kChannels]) {
++        uint32_t sum = 0, weighted = 0;
++        uint8_t top = 0;
++        for (int i = 0; i < kChannels; i++) {
++            if (!(active & (1u << i))) continue;
++            sum += levels[i];
++            weighted += static_cast<uint32_t>(i) * levels[i];
++            if (levels[i] > top) top = levels[i];
++        }
++        if (sum == 0 || top < cfg_.centroid_min_level) return;
++        const float c = static_cast<float>(weighted) / static_cast<float>(sum);
++        if (!cen_valid_) {
++            cen_min_ = cen_max_ = c;
++            cen_valid_ = true;
++        } else {
++            if (c < cen_min_) cen_min_ = c;
++            if (c > cen_max_) cen_max_ = c;
++        }
++    }
++
++    TouchGestureConfig cfg_;
++    bool cen_valid_ = false;
++    float cen_min_ = 0.0f;
++    float cen_max_ = 0.0f;
++    bool started_ = false;
++    bool in_grace_ = true;
++    uint32_t begin_ms_ = 0;
++    uint32_t last_tick_ms_ = 0;
++
++    uint8_t masked_ = 0;
++    uint32_t recalibrations_ = 0;
++    uint32_t settle_resets_ = 0;
++    bool settle_active_ = false;
++    uint32_t settle_until_ms_ = 0;
++    uint8_t peak_level_ = 0;
++    uint32_t nonzero_ms_[kChannels] = {0, 0, 0};
++    uint32_t zero_ms_[kChannels] = {0, 0, 0};
++    uint32_t unmask_need_ms_[kChannels] = {1000, 1000, 1000};
++    bool press_in_settle_ = false;
++
++    bool pressed_ = false;
++    bool press_dirty_ = false;
++    bool moved_ = false;
++    uint32_t press_start_ms_ = 0;
++    uint32_t last_active_ms_ = 0;
++    uint32_t zero_ticks_ = 0;
++    uint8_t start_zones_ = 0;
++    bool press_all_zones_weak_ = false;
++    uint8_t seen_new_ = 0;
++    uint8_t vacated_ = 0;
++    uint32_t new_ticks_[kChannels] = {0, 0, 0};
++    uint32_t off_ticks_[kChannels] = {0, 0, 0};
++
++    bool cooldown_valid_ = false;
++    uint32_t cooldown_from_ms_ = 0;
++};
++
++}  // namespace touch
++}  // namespace stackchan
+diff --git a/main/mcp_server.cc b/main/mcp_server.cc
+index 0bcd632..5dbb87d 100644
+--- a/main/mcp_server.cc
++++ b/main/mcp_server.cc
+@@ -408,6 +408,10 @@ void McpServer::ReplyResult(int id, const std::string& result) {
+     payload += std::to_string(id) + ",\"result\":";
+     payload += result;
+     payload += "}";
++    if (id >= kHttpRpcIdBase && result_sink_) {
++        result_sink_(id, payload);
++        return;
++    }
+     Application::GetInstance().SendMcpMessage(payload);
+ }
+ 
+@@ -417,6 +421,10 @@ void McpServer::ReplyError(int id, const std::string& message) {
+     payload += ",\"error\":{\"message\":\"";
+     payload += message;
+     payload += "\"}}";
++    if (id >= kHttpRpcIdBase && result_sink_) {
++        result_sink_(id, payload);
++        return;
++    }
+     Application::GetInstance().SendMcpMessage(payload);
+ }
+ 
+diff --git a/main/mcp_server.h b/main/mcp_server.h
+index dacdd55..8013cee 100644
+--- a/main/mcp_server.h
++++ b/main/mcp_server.h
+@@ -9,6 +9,7 @@
+ #include <optional>
+ #include <stdexcept>
+ #include <thread>
++#include <utility>
+ #include <mbedtls/base64.h>
+ 
+ #include <cJSON.h>
+@@ -313,11 +314,22 @@ public:
+ 
+ class McpServer {
+ public:
++    // JSON-RPC id 从该值起保留给本地 HTTP 桥（NotifyHttpServer 的 /mcp、/tools）。
++    // 这些 id 的响应不再走 Application::SendMcpMessage()（wss 通道），而是交给
++    // SetResultSink() 注册的同步接收器，让局域网 HTTP 调用也能拿到工具返回值。
++    // 云端 wss 的 id 都是小整数，完全不受影响。
++    static constexpr int kHttpRpcIdBase = 1000000;
++
++    using ResultSink = std::function<void(int id, const std::string& jsonrpc_response)>;
++
+     static McpServer& GetInstance() {
+         static McpServer instance;
+         return instance;
+     }
+ 
++    // 传 nullptr 取消接收。仅在设备本地 HTTP 服务启动时设置一次。
++    void SetResultSink(ResultSink sink) { result_sink_ = std::move(sink); }
++
+     void AddCommonTools();
+     void AddUserOnlyTools();
+     void AddTool(McpTool* tool);
+@@ -339,6 +351,7 @@ private:
+     void DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments);
+ 
+     std::vector<McpTool*> tools_;
++    ResultSink result_sink_;
+ };
+ 
+ #endif // MCP_SERVER_H
+diff --git a/main/notify_http_server.cc b/main/notify_http_server.cc
+index 9666034..693d1d1 100644
+--- a/main/notify_http_server.cc
++++ b/main/notify_http_server.cc
+@@ -1,16 +1,59 @@
+ #include "notify_http_server.h"
+ #include "mcp_server.h"
++#include "settings.h"
++
++#include <atomic>
++#include <mutex>
++#include <string>
+ 
+-#include <esp_log.h>
+ #include <cJSON.h>
++#include <esp_log.h>
++#include <esp_system.h>
++#include <esp_timer.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/semphr.h>
+ #include <cstring>
+ #include <cstdlib>
+-#include <string>
+ 
+ static const char* TAG = "NotifyHttp";
+ 
+-// MCP JSON-RPC 递增 id，避开跟 wss 那一路重叠（wss 那边从小数字起）
+-static int g_notify_rpc_id = 1000000;
++// 本地 HTTP 调用专用 JSON-RPC id 段。McpServer 对这段 id 的响应改走 ResultSink，
++// 云端 wss 的小 id 不受影响。
++static std::atomic<int> g_http_rpc_id{McpServer::kHttpRpcIdBase};
++
++// ── 同步结果接收（一次只允许一个 /mcp 或 /tools 在飞） ──────────────────
++static std::mutex g_call_mutex;
++static SemaphoreHandle_t g_reply_sem = nullptr;
++static std::atomic<int> g_expected_id{-1};
++static std::string g_reply_payload;
++
++static void HttpResultSink(int id, const std::string& payload) {
++    if (id != g_expected_id.load()) {
++        return;  // /notify、/dismiss 等异步调用的响应，直接丢弃
++    }
++    g_reply_payload = payload;
++    if (g_reply_sem != nullptr) {
++        xSemaphoreGive(g_reply_sem);
++    }
++}
++
++static int NextHttpRpcId() {
++    return g_http_rpc_id.fetch_add(1);
++}
++
++static std::string JsonRpcError(int id, const char* message) {
++    return std::string("{\"jsonrpc\":\"2.0\",\"id\":") + std::to_string(id) +
++           ",\"error\":{\"message\":\"" + message + "\"}}";
++}
++
++static void SendJson(httpd_req_t* req, const std::string& payload) {
++    httpd_resp_set_type(req, "application/json");
++    httpd_resp_send(req, payload.c_str(), payload.size());
++}
++
++static void DeferredRestart(void*) {
++    esp_restart();
++}
+ 
+ NotifyHttpServer::NotifyHttpServer() : server_handle_(nullptr) {}
+ 
+@@ -18,7 +61,31 @@ NotifyHttpServer::~NotifyHttpServer() {
+     Stop();
+ }
+ 
+-// ── HTTP handlers ──────────────────────────────────────────────────────
++// ── 通用工具 ───────────────────────────────────────────────────────────
++
++bool NotifyHttpServer::ReadBody(httpd_req_t* req, size_t max_len, std::string* out) {
++    out->clear();
++    if (req->content_len == 0) {
++        return true;
++    }
++    if ((size_t)req->content_len > max_len) {
++        return false;
++    }
++    out->resize(req->content_len);
++    size_t total = 0;
++    while (total < out->size()) {
++        int r = httpd_req_recv(req, &(*out)[total], out->size() - total);
++        if (r <= 0) {
++            if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
++            out->clear();
++            return false;
++        }
++        total += (size_t)r;
++    }
++    return true;
++}
++
++// ── 原有三个接口（保持行为不变） ───────────────────────────────────────
+ 
+ esp_err_t NotifyHttpServer::notify_handler(httpd_req_t* req) {
+     auto* self = static_cast<NotifyHttpServer*>(req->user_ctx);
+@@ -27,33 +94,19 @@ esp_err_t NotifyHttpServer::notify_handler(httpd_req_t* req) {
+         return ESP_FAIL;
+     }
+ 
+-    // 读 body（≤ 512 字节够用；project 名字撑死几十字节）
+-    if (req->content_len > 512) {
++    std::string body;
++    if (!ReadBody(req, 512, &body)) {
+         httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "body too large");
+         return ESP_FAIL;
+     }
+-    char buf[513];
+-    int total = 0;
+-    while (total < (int)req->content_len) {
+-        int r = httpd_req_recv(req, buf + total, req->content_len - total);
+-        if (r <= 0) {
+-            if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail");
+-            return ESP_FAIL;
+-        }
+-        total += r;
+-    }
+-    buf[total] = '\0';
+ 
+-    // 解析 body 拿 project；缺失就用 "unknown"
+     std::string project = "unknown";
+-    if (total > 0) {
+-        cJSON* root = cJSON_Parse(buf);
++    if (!body.empty()) {
++        cJSON* root = cJSON_Parse(body.c_str());
+         if (root != nullptr) {
+             cJSON* p = cJSON_GetObjectItem(root, "project");
+             if (p && cJSON_IsString(p) && p->valuestring != nullptr) {
+                 project = p->valuestring;
+-                // 限制长度，防止屏幕溢出 / MCP payload 过大
+                 if (project.size() > 40) project = project.substr(0, 40);
+             }
+             cJSON_Delete(root);
+@@ -74,14 +127,8 @@ esp_err_t NotifyHttpServer::dismiss_handler(httpd_req_t* req) {
+         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ctx");
+         return ESP_FAIL;
+     }
+-    // 丢弃 body（如果有）
+-    char sink[64];
+-    int remaining = req->content_len;
+-    while (remaining > 0) {
+-        int r = httpd_req_recv(req, sink, sizeof(sink) < (size_t)remaining ? sizeof(sink) : remaining);
+-        if (r <= 0) break;
+-        remaining -= r;
+-    }
++    std::string sink_body;
++    ReadBody(req, 512, &sink_body);  // 丢弃 body，避免连接残留
+ 
+     ESP_LOGI(TAG, "dismiss");
+     self->InvokeDismiss();
+@@ -93,19 +140,189 @@ esp_err_t NotifyHttpServer::dismiss_handler(httpd_req_t* req) {
+ 
+ esp_err_t NotifyHttpServer::healthz_handler(httpd_req_t* req) {
+     httpd_resp_set_type(req, "application/json");
+-    httpd_resp_sendstr(req, "{\"ok\":true,\"service\":\"stackchan-notify\"}");
++    httpd_resp_sendstr(req, "{\"ok\":true,\"service\":\"stackchan-notify\",\"mcp\":true,\"config\":true}");
++    return ESP_OK;
++}
++
++// ── 新增：GET /tools —— 列出设备已注册的全部 MCP 工具 ──────────────────
++
++esp_err_t NotifyHttpServer::tools_handler(httpd_req_t* req) {
++    auto* self = static_cast<NotifyHttpServer*>(req->user_ctx);
++    if (self == nullptr) {
++        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ctx");
++        return ESP_FAIL;
++    }
++    int id = NextHttpRpcId();
++    std::string request = std::string("{\"jsonrpc\":\"2.0\",\"id\":") +
++                          std::to_string(id) +
++                          ",\"method\":\"tools/list\",\"params\":{}}";
++    SendJson(req, self->CallMcpSync(request, id));
++    return ESP_OK;
++}
++
++// ── 新增：POST /mcp —— 通用 MCP JSON-RPC 中继 ─────────────────────────
++//
++// 接受两种 body：
++//   1) 标准 JSON-RPC：{"jsonrpc":"2.0","id":1,"method":"tools/call",
++//                     "params":{"name":"self.head.nod","arguments":{}}}
++//      （id 会被替换成本地 HTTP 段，method / params 原样转发）
++//   2) 简写：{"tool":"self.head.move","arguments":{"yaw":20,"pitch":35}}
++// 也支持 method = "tools/list" / "initialize"。
++
++esp_err_t NotifyHttpServer::mcp_handler(httpd_req_t* req) {
++    auto* self = static_cast<NotifyHttpServer*>(req->user_ctx);
++    if (self == nullptr) {
++        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ctx");
++        return ESP_FAIL;
++    }
++
++    std::string body;
++    if (!ReadBody(req, 4096, &body)) {
++        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "body too large (max 4096)");
++        return ESP_FAIL;
++    }
++
++    cJSON* input = cJSON_Parse(body.c_str());
++    if (input == nullptr || !cJSON_IsObject(input)) {
++        if (input) cJSON_Delete(input);
++        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON object");
++        return ESP_FAIL;
++    }
++
++    int id = NextHttpRpcId();
++    cJSON* request = cJSON_CreateObject();
++    cJSON_AddStringToObject(request, "jsonrpc", "2.0");
++    cJSON_AddNumberToObject(request, "id", id);
++
++    cJSON* method = cJSON_GetObjectItem(input, "method");
++    cJSON* tool = cJSON_GetObjectItem(input, "tool");
++
++    if (method != nullptr && cJSON_IsString(method)) {
++        cJSON_AddStringToObject(request, "method", method->valuestring);
++        cJSON* params = cJSON_GetObjectItem(input, "params");
++        cJSON_AddItemToObject(request, "params",
++                              params != nullptr ? cJSON_Duplicate(params, true)
++                                               : cJSON_CreateObject());
++    } else if (tool != nullptr && cJSON_IsString(tool)) {
++        cJSON_AddStringToObject(request, "method", "tools/call");
++        cJSON* params = cJSON_CreateObject();
++        cJSON_AddStringToObject(params, "name", tool->valuestring);
++        cJSON* args = cJSON_GetObjectItem(input, "arguments");
++        cJSON_AddItemToObject(params, "arguments",
++                              args != nullptr ? cJSON_Duplicate(args, true)
++                                             : cJSON_CreateObject());
++        cJSON_AddItemToObject(request, "params", params);
++    } else {
++        cJSON_Delete(request);
++        cJSON_Delete(input);
++        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "need method or tool");
++        return ESP_FAIL;
++    }
++
++    char* raw = cJSON_PrintUnformatted(request);
++    std::string jsonrpc_request(raw);
++    cJSON_free(raw);
++    cJSON_Delete(request);
++    cJSON_Delete(input);
++
++    SendJson(req, self->CallMcpSync(jsonrpc_request, id));
++    return ESP_OK;
++}
++
++// ── 新增：GET /config / POST /config —— 切本地 gateway 不用重编译 ──────
++
++static std::string BuildConfigJson() {
++    Settings ws("websocket", false);
++    Settings wifi("wifi", false);
++    std::string url = ws.GetString("url");
++    std::string token = ws.GetString("token");
++    std::string ota = wifi.GetString("ota_url");
++
++    cJSON* root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "websocket_url", url.c_str());
++    cJSON_AddBoolToObject(root, "websocket_token_set", !token.empty());
++    cJSON_AddNumberToObject(root, "websocket_version", ws.GetInt("version", 0));
++    cJSON_AddStringToObject(root, "ota_url", ota.c_str());
++    cJSON_AddStringToObject(root, "mode", url.empty() ? "xiaozhi-cloud" : "custom-ws");
++    char* raw = cJSON_PrintUnformatted(root);
++    std::string result(raw);
++    cJSON_free(raw);
++    cJSON_Delete(root);
++    return result;
++}
++
++esp_err_t NotifyHttpServer::config_get_handler(httpd_req_t* req) {
++    SendJson(req, BuildConfigJson());
++    return ESP_OK;
++}
++
++esp_err_t NotifyHttpServer::config_post_handler(httpd_req_t* req) {
++    std::string body;
++    if (!ReadBody(req, 1024, &body)) {
++        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "body too large");
++        return ESP_FAIL;
++    }
++    cJSON* root = cJSON_Parse(body.c_str());
++    if (root == nullptr || !cJSON_IsObject(root)) {
++        if (root) cJSON_Delete(root);
++        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON object");
++        return ESP_FAIL;
++    }
++
++    // 只改显式给出的字段；{"clear":true} 用于清掉自定义 WS 回到小智云。
++    {
++        Settings ws("websocket", true);
++        cJSON* v = cJSON_GetObjectItem(root, "websocket_url");
++        if (v != nullptr && cJSON_IsString(v)) ws.SetString("url", v->valuestring);
++        v = cJSON_GetObjectItem(root, "websocket_token");
++        if (v != nullptr && cJSON_IsString(v)) ws.SetString("token", v->valuestring);
++        v = cJSON_GetObjectItem(root, "websocket_version");
++        if (v != nullptr && cJSON_IsNumber(v)) ws.SetInt("version", (int32_t)v->valueint);
++        cJSON* clear = cJSON_GetObjectItem(root, "clear");
++        if (clear != nullptr && cJSON_IsTrue(clear)) {
++            ws.EraseKey("url");
++            ws.EraseKey("token");
++            // Settings::EraseKey() 不会置 dirty_，析构时就不会 nvs_commit。
++            // 补一次写操作确保上面两个删除落盘（version=0 等价于默认）。
++            ws.SetInt("version", 0);
++        }
++    }
++    {
++        Settings wifi("wifi", true);
++        cJSON* v = cJSON_GetObjectItem(root, "ota_url");
++        if (v != nullptr && cJSON_IsString(v)) wifi.SetString("ota_url", v->valuestring);
++    }
++
++    cJSON* restart = cJSON_GetObjectItem(root, "restart");
++    bool do_restart = (restart != nullptr && cJSON_IsTrue(restart));
++    cJSON_Delete(root);
++
++    std::string result = BuildConfigJson();
++    // 把重启标记拼到响应里，方便调用方确认
++    result = std::string("{\"ok\":true,\"restart\":") + (do_restart ? "true" : "false") +
++             ",\"config\":" + result + "}";
++    SendJson(req, result);
++    ESP_LOGI(TAG, "config updated: %s", result.c_str());
++
++    if (do_restart) {
++        // 延后 800ms，让 HTTP 响应先发出去再重启
++        esp_timer_create_args_t args = {};
++        args.callback = &DeferredRestart;
++        args.name = "http_restart";
++        esp_timer_handle_t timer = nullptr;
++        if (esp_timer_create(&args, &timer) == ESP_OK) {
++            esp_timer_start_once(timer, 800000);
++        }
++    }
+     return ESP_OK;
+ }
+ 
+ // ── 内部：把 HTTP 请求转成 MCP tools/call 报文 ─────────────────────────
+ 
+ void NotifyHttpServer::InvokeAttention(const char* project) {
+-    // 构造 JSON-RPC 2.0：{"jsonrpc":"2.0","id":N,"method":"tools/call",
+-    //                    "params":{"name":"self.notify.attention",
+-    //                              "arguments":{"project":"..."}}}
+     cJSON* root = cJSON_CreateObject();
+     cJSON_AddStringToObject(root, "jsonrpc", "2.0");
+-    cJSON_AddNumberToObject(root, "id", g_notify_rpc_id++);
++    cJSON_AddNumberToObject(root, "id", NextHttpRpcId());
+     cJSON_AddStringToObject(root, "method", "tools/call");
+     cJSON* params = cJSON_CreateObject();
+     cJSON_AddStringToObject(params, "name", "self.notify.attention");
+@@ -121,7 +338,7 @@ void NotifyHttpServer::InvokeAttention(const char* project) {
+ void NotifyHttpServer::InvokeDismiss() {
+     cJSON* root = cJSON_CreateObject();
+     cJSON_AddStringToObject(root, "jsonrpc", "2.0");
+-    cJSON_AddNumberToObject(root, "id", g_notify_rpc_id++);
++    cJSON_AddNumberToObject(root, "id", NextHttpRpcId());
+     cJSON_AddStringToObject(root, "method", "tools/call");
+     cJSON* params = cJSON_CreateObject();
+     cJSON_AddStringToObject(params, "name", "self.notify.dismiss");
+@@ -132,6 +349,39 @@ void NotifyHttpServer::InvokeDismiss() {
+     cJSON_Delete(root);
+ }
+ 
++// 同步执行一次 JSON-RPC 调用。工具回调由 Application 主循环执行（线程安全），
++// 响应经 ResultSink 投递回本任务，用二值信号量等待，超时 8 秒。
++std::string NotifyHttpServer::CallMcpSync(const std::string& jsonrpc_request, int id) {
++    std::lock_guard<std::mutex> lock(g_call_mutex);
++    if (g_reply_sem == nullptr) {
++        return JsonRpcError(id, "mcp sink not initialized");
++    }
++
++    while (xSemaphoreTake(g_reply_sem, 0) == pdTRUE) {
++        // 清掉上一次遗留的信号
++    }
++    g_reply_payload.clear();
++    g_expected_id.store(id);
++
++    cJSON* json = cJSON_Parse(jsonrpc_request.c_str());
++    if (json == nullptr) {
++        g_expected_id.store(-1);
++        return JsonRpcError(id, "invalid internal JSON-RPC");
++    }
++    McpServer::GetInstance().ParseMessage(json);
++    cJSON_Delete(json);
++
++    if (xSemaphoreTake(g_reply_sem, pdMS_TO_TICKS(8000)) != pdTRUE) {
++        g_expected_id.store(-1);
++        return JsonRpcError(id, "device tool call timed out");
++    }
++    g_expected_id.store(-1);
++    if (g_reply_payload.empty()) {
++        return JsonRpcError(id, "empty tool response");
++    }
++    return g_reply_payload;
++}
++
+ // ── Start / Stop ───────────────────────────────────────────────────────
+ 
+ bool NotifyHttpServer::Start(int port) {
+@@ -140,12 +390,16 @@ bool NotifyHttpServer::Start(int port) {
+         return true;
+     }
+ 
++    if (g_reply_sem == nullptr) {
++        g_reply_sem = xSemaphoreCreateBinary();
++    }
++    // 只影响 id >= kHttpRpcIdBase 的本地调用；云端 wss 通道不变
++    McpServer::GetInstance().SetResultSink(&HttpResultSink);
++
+     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+     config.server_port = port;
+     config.max_open_sockets = 4;
+-    // ctrl_port 跟 otto 的 32769 岔开，避免两个 board 共存时冲突
+     config.ctrl_port = 32770;
+-    // 加长栈（cJSON + McpServer::ParseMessage 内部会摸 servo/Alert，栈用得凶）
+     config.stack_size = 8192;
+ 
+     if (httpd_start(&server_handle_, &config) != ESP_OK) {
+@@ -155,28 +409,35 @@ bool NotifyHttpServer::Start(int port) {
+     }
+ 
+     httpd_uri_t uri_notify = {
+-        .uri = "/notify",
+-        .method = HTTP_POST,
+-        .handler = notify_handler,
+-        .user_ctx = this,
++        .uri = "/notify", .method = HTTP_POST, .handler = notify_handler, .user_ctx = this,
+     };
+     httpd_uri_t uri_dismiss = {
+-        .uri = "/dismiss",
+-        .method = HTTP_POST,
+-        .handler = dismiss_handler,
+-        .user_ctx = this,
++        .uri = "/dismiss", .method = HTTP_POST, .handler = dismiss_handler, .user_ctx = this,
+     };
+     httpd_uri_t uri_healthz = {
+-        .uri = "/healthz",
+-        .method = HTTP_GET,
+-        .handler = healthz_handler,
+-        .user_ctx = this,
++        .uri = "/healthz", .method = HTTP_GET, .handler = healthz_handler, .user_ctx = this,
++    };
++    httpd_uri_t uri_tools = {
++        .uri = "/tools", .method = HTTP_GET, .handler = tools_handler, .user_ctx = this,
++    };
++    httpd_uri_t uri_mcp = {
++        .uri = "/mcp", .method = HTTP_POST, .handler = mcp_handler, .user_ctx = this,
++    };
++    httpd_uri_t uri_config_get = {
++        .uri = "/config", .method = HTTP_GET, .handler = config_get_handler, .user_ctx = this,
++    };
++    httpd_uri_t uri_config_post = {
++        .uri = "/config", .method = HTTP_POST, .handler = config_post_handler, .user_ctx = this,
+     };
+     httpd_register_uri_handler(server_handle_, &uri_notify);
+     httpd_register_uri_handler(server_handle_, &uri_dismiss);
+     httpd_register_uri_handler(server_handle_, &uri_healthz);
++    httpd_register_uri_handler(server_handle_, &uri_tools);
++    httpd_register_uri_handler(server_handle_, &uri_mcp);
++    httpd_register_uri_handler(server_handle_, &uri_config_get);
++    httpd_register_uri_handler(server_handle_, &uri_config_post);
+ 
+-    ESP_LOGI(TAG, "HTTP notify server started on port %d (POST /notify, POST /dismiss, GET /healthz)", port);
++    ESP_LOGI(TAG, "HTTP MCP server on port %d: /notify /dismiss /healthz /tools /mcp /config", port);
+     return true;
+ }
+ 
+@@ -184,6 +445,11 @@ void NotifyHttpServer::Stop() {
+     if (server_handle_ != nullptr) {
+         httpd_stop(server_handle_);
+         server_handle_ = nullptr;
+-        ESP_LOGI(TAG, "HTTP notify server stopped");
++        ESP_LOGI(TAG, "HTTP MCP server stopped");
++    }
++    McpServer::GetInstance().SetResultSink(nullptr);
++    if (g_reply_sem != nullptr) {
++        vSemaphoreDelete(g_reply_sem);
++        g_reply_sem = nullptr;
+     }
+ }
+diff --git a/main/notify_http_server.h b/main/notify_http_server.h
+index 4993615..5493a66 100644
+--- a/main/notify_http_server.h
++++ b/main/notify_http_server.h
+@@ -1,21 +1,37 @@
+ #ifndef NOTIFY_HTTP_SERVER_H
+ #define NOTIFY_HTTP_SERVER_H
+ 
+-// Notify HTTP server —— 独立于小智 wss 通道，让 Mac 端 hook 能通过局域网
+-// HTTP POST 直接触发派蒙的"注意力提醒"动作（Claude Code 等确认时用）。
++// Notify / local MCP HTTP server —— 独立于小智 wss 通道，让 Mac 端通过局域网
++// HTTP 直接驱动派蒙，不依赖云端、不依赖 Qoder、不需要本地 WebSocket gateway。
++//
++// 原有能力（保留，向后兼容 claude-bridge-mcp / WorkBuddy 连接器）：
++//   POST /notify   {"project": "xxx"}  触发"等你确认"注意力提醒
++//   POST /dismiss                      清除提醒
++//   GET  /healthz                     健康检查
++//
++// 功能整合新增：
++//   GET  /tools                       返回设备已注册的全部 MCP 工具（tools/list）
++//   POST /mcp                        通用 MCP JSON-RPC 中继，同步返回结果
++//                                    也接受简写 {"tool":"...","arguments":{...}}
++//   GET  /config                     读 NVS 里的 websocket / ota 配置（token 打码）
++//   POST /config                     写 NVS 配置，可带 {"restart":true} 立即重启
+ //
+ // 设计要点：
+-//  1. 纯 HTTP POST，不是 WebSocket —— Mac 端 curl 就能触发，简单可靠。
+-//  2. 请求 body 转成 JSON-RPC 2.0 报文 → McpServer::ParseMessage()
+-//     完全复用 MCP 工具体系；跟 otto-robot 的 ws 桥同思路（otto 已在跑，
+-//     线程安全在 httpd task 里已被上游验证过）。
++//  1. /mcp 把 JSON-RPC 交给 McpServer::ParseMessage()，复用设备全部工具实现；
++//     McpServer 对 id >= kHttpRpcIdBase 的响应改投递给 ResultSink，由本服务
++//     同步回给 HTTP 调用方。云端 wss 的小 id 完全不受影响。
++//  2. /config 解决"设备怎么连本地 gateway"这个结构性卡点：WebsocketProtocol
++//     从 NVS namespace "websocket" 读 url/token/version，Ota 从 "wifi" 读
++//     ota_url。写进 NVS 后重启即可在小智云与自托管 gateway 之间切换，
++//     不需要重新编译或擦除 Wi-Fi 配置。
+ //  3. 端口 8788（跟 kindle-monitor 的 8787 岔开，两套独立）。
+-//  4. URI：POST /notify {"project": "xxx"} / POST /dismiss / GET /healthz
+ //
+-// 用法（在 board 构造里）：
++// 用法（在 board 的 StartNetwork() 里）：
+ //    notify_http_server_ = new NotifyHttpServer();
+ //    notify_http_server_->Start(8788);
+ 
++#include <string>
++
+ #include <esp_http_server.h>
+ 
+ class NotifyHttpServer {
+@@ -33,10 +49,20 @@ private:
+     static esp_err_t notify_handler(httpd_req_t* req);
+     static esp_err_t dismiss_handler(httpd_req_t* req);
+     static esp_err_t healthz_handler(httpd_req_t* req);
++    static esp_err_t tools_handler(httpd_req_t* req);
++    static esp_err_t mcp_handler(httpd_req_t* req);
++    static esp_err_t config_get_handler(httpd_req_t* req);
++    static esp_err_t config_post_handler(httpd_req_t* req);
++
++    // 把 POST body 完整读进 std::string；超长返回 false
++    static bool ReadBody(httpd_req_t* req, size_t max_len, std::string* out);
+ 
+     // 收到 POST 后把 body 里的 project 名字装进 MCP 报文，触发 self.notify.attention
+     void InvokeAttention(const char* project);
+     void InvokeDismiss();
++
++    // 同步执行一次 JSON-RPC 调用，返回完整 JSON-RPC 响应字符串
++    std::string CallMcpSync(const std::string& jsonrpc_request, int id);
+ };
+ 
+ #endif  // NOTIFY_HTTP_SERVER_H
+diff --git a/main/porting_extras/README.md b/main/porting_extras/README.md
+new file mode 100644
+index 0000000..e77f7ea
+--- /dev/null
++++ b/main/porting_extras/README.md
+@@ -0,0 +1,33 @@
++# porting_extras —— 从 stackchan-mcp 抽出的可复用模块（暂存区）
++
++来源：`kisaragi-mochi/stackchan-mcp`（`firmware/` 是 `78/xiaozhi-esp32` v2.2.6 的 subtree），
++完整解析见工作区 `analysis/PORTING.md`。
++
++**这个目录下的 `.cc` 不参与当前构建。** `main/CMakeLists.txt` 的 SOURCES 是显式清单 +
++板卡目录 GLOB，不匹配 `main/porting_extras/`，所以放进来不会影响编译，也不会让
++上游基线回退。它们是「搬进仓库、等接线」的素材，接法写在下面。
++
++## 已直接落位（无需接线）
++
++| 文件 | 状态 |
++|---|---|
++| `../boards/m5stack-core-s3/touch_gesture.h` | 纯 C++、无 IDF 依赖的 Si12T 三区手势状态机（TAP / STROKE / 卡死通道恢复）。已放进板卡目录，头文件不会被 GLOB 编译，随时可 `#include` |
++| `../boards/m5stack-core-s3/power_save_gate.h` | 外电/电池下是否跑省电定时器的判定 + 状态去重 |
++| `../boards/m5stack-core-s3/PORTING_NOTES.md` | 上游板卡的硬件踩坑记录（SCS0009 启动延迟、boot 抬头撞限位、Si12T 误触发等） |
++
++## 暂存、需要接线才生效
++
++| 路径 | 用途 | 激活步骤 |
++|---|---|---|
++| `feetech_scs/` | MIT 版 SCS0009 舵机驱动（**不要**碰 GPL-3.0 的 `SCServo_lib`/`SCS.*`） | 整个目录移到仓库根 `components/feetech_scs/`，IDF 会自动发现；`CMakeLists.txt` 只需 `driver`。注意：仓库根 `.gitignore` 有 `components/` 规则，所以暂存时**不能**放在任何叫 `components/` 的子目录里，否则会被静默忽略 |
++| `extras/listening_profile/` | listen / beat 采集 profile 解析 | 把两个 `.cc` 加进 `main/CMakeLists.txt` 的 SOURCES，并在调用方 include 对应 `.h` |
++| `extras/mdns/` | gateway 自动发现（`_stackchan-mcp._tcp`） | ① `main/idf_component.yml` 加 `espressif/mdns: ^1.8.2`；② `main/Kconfig.projbuild` 加 `CONFIG_STACKCHAN_MDNS_DISCOVERY`；③ 四个文件加进 SOURCES；④ 在 `WebsocketProtocol::OpenAudioChannel()` 里接候选 URL |
++
++## 明确不搬
++
++- `SCS.*` / `SCSCL.*` / `SCSerial.*` / `INST.h` / `SCServo.h`：GPL-3.0，会污染本仓库 MIT 许可证。
++- `boards/stackchan/stackchan.cc`（8430 行）：整板卡实现，若要做「并列第二板卡」，
++  从 `analysis/porting/boards/stackchan/` 复制并加 `CONFIG_BOARD_TYPE_STACKCHAN` 构建分支，
++  **不要**替换现有 `m5stack-core-s3`。
++- `application.cc` / `websocket_protocol.cc` / `audio_service.cc` 全文：大部分 diff 是
++  v2.2.6 与本 fork 基线之间的版本差，整文件覆盖等于把上游代码回退。
+diff --git a/main/porting_extras/extras/listening_profile/listening_profile.cc b/main/porting_extras/extras/listening_profile/listening_profile.cc
+new file mode 100644
+index 0000000..0e90e91
+--- /dev/null
++++ b/main/porting_extras/extras/listening_profile/listening_profile.cc
+@@ -0,0 +1,26 @@
++#include "listening_profile.h"
++
++#include <cstring>
++
++ListenProfileParseResult ParseListenProfileField(bool profile_present,
++                                                 bool profile_is_string,
++                                                 const char* profile_value) {
++    if (!profile_present) {
++        return {};
++    }
++    if (!profile_is_string) {
++        return {kListeningProfileVoice, kListenProfileParseWarningNonString};
++    }
++    if (profile_value != nullptr && strcmp(profile_value, "raw") == 0) {
++        return {kListeningProfileRaw, kListenProfileParseWarningNone};
++    }
++    if (profile_value != nullptr && strcmp(profile_value, "voice") == 0) {
++        return {kListeningProfileVoice, kListenProfileParseWarningNone};
++    }
++    return {kListeningProfileVoice, kListenProfileParseWarningUnknown};
++}
++
++ListeningProfile ListeningProfileAfterStop(ListeningProfile profile) {
++    (void)profile;
++    return kListeningProfileVoice;
++}
+diff --git a/main/porting_extras/extras/listening_profile/listening_profile.h b/main/porting_extras/extras/listening_profile/listening_profile.h
+new file mode 100644
+index 0000000..1b4b4ce
+--- /dev/null
++++ b/main/porting_extras/extras/listening_profile/listening_profile.h
+@@ -0,0 +1,25 @@
++#ifndef LISTENING_PROFILE_H
++#define LISTENING_PROFILE_H
++
++enum ListeningProfile {
++    kListeningProfileVoice,
++    kListeningProfileRaw,
++};
++
++enum ListenProfileParseWarning {
++    kListenProfileParseWarningNone,
++    kListenProfileParseWarningNonString,
++    kListenProfileParseWarningUnknown,
++};
++
++struct ListenProfileParseResult {
++    ListeningProfile profile = kListeningProfileVoice;
++    ListenProfileParseWarning warning = kListenProfileParseWarningNone;
++};
++
++ListenProfileParseResult ParseListenProfileField(bool profile_present,
++                                                 bool profile_is_string,
++                                                 const char* profile_value);
++ListeningProfile ListeningProfileAfterStop(ListeningProfile profile);
++
++#endif  // LISTENING_PROFILE_H
+diff --git a/main/porting_extras/extras/mdns/mdns_candidate_extract.cc b/main/porting_extras/extras/mdns/mdns_candidate_extract.cc
+new file mode 100644
+index 0000000..8ac7468
+--- /dev/null
++++ b/main/porting_extras/extras/mdns/mdns_candidate_extract.cc
+@@ -0,0 +1,166 @@
++#include "mdns_candidate_extract.h"
++
++#include <esp_netif_ip_addr.h>
++
++#if defined(STACKCHAN_MDNS_HOST_TEST)
++#define ESP_LOGI(tag, format, ...) \
++    do {                           \
++        (void)(tag);               \
++    } while (0)
++#define ESP_LOGW(tag, format, ...) \
++    do {                           \
++        (void)(tag);               \
++    } while (0)
++#else
++#include <esp_log.h>
++#endif
++
++#include <cstdio>
++#include <cstring>
++#include <optional>
++
++#define TAG "WS"
++
++namespace stackchan::mdns {
++
++std::string SafeString(const char* value) {
++    return value == nullptr ? std::string() : std::string(value);
++}
++
++int CountResults(const mdns_result_t* results) {
++    int count = 0;
++    for (const mdns_result_t* result = results; result != nullptr; result = result->next) {
++        ++count;
++    }
++    return count;
++}
++
++std::optional<std::string> TxtValue(const mdns_result_t* result, const char* key) {
++    if (result == nullptr || key == nullptr) {
++        return std::nullopt;
++    }
++    for (size_t i = 0; i < result->txt_count; ++i) {
++        if (result->txt[i].key == nullptr || strcmp(result->txt[i].key, key) != 0) {
++            continue;
++        }
++        if (result->txt[i].value == nullptr) {
++            return std::string();
++        }
++        if (result->txt_value_len != nullptr) {
++            return std::string(result->txt[i].value, result->txt_value_len[i]);
++        }
++        return std::string(result->txt[i].value);
++    }
++    return std::nullopt;
++}
++
++std::string NormalizePath(const std::optional<std::string>& maybe_path) {
++    if (!maybe_path.has_value() || maybe_path->empty()) {
++        return "/";
++    }
++    if ((*maybe_path)[0] == '/') {
++        return *maybe_path;
++    }
++    return "/" + *maybe_path;
++}
++
++bool IsUsableIpv4String(const std::string& address) {
++    if (address.empty() || address == "0.0.0.0") {
++        return false;
++    }
++    if (address.rfind("127.", 0) == 0) {
++        return false;
++    }
++    int first_octet = 0;
++    if (sscanf(address.c_str(), "%d", &first_octet) != 1) {
++        return false;
++    }
++    return first_octet < 224;
++}
++
++std::vector<std::string> UsableIpv4Addresses(const mdns_result_t* result) {
++    std::vector<std::string> addresses;
++    for (mdns_ip_addr_t* address = result == nullptr ? nullptr : result->addr;
++         address != nullptr;
++         address = address->next) {
++        if (address->addr.type != ESP_IPADDR_TYPE_V4) {
++            continue;
++        }
++        char buffer[16] = {0};
++        snprintf(buffer, sizeof(buffer), IPSTR, IP2STR(&address->addr.u_addr.ip4));
++        std::string ipv4(buffer);
++        if (!IsUsableIpv4String(ipv4)) {
++            continue;
++        }
++        addresses.push_back(ipv4);
++    }
++    return addresses;
++}
++
++std::string JoinAddresses(const std::vector<std::string>& addresses) {
++    if (addresses.empty()) {
++        return std::string();
++    }
++    std::string joined = addresses.front();
++    for (size_t i = 1; i < addresses.size(); ++i) {
++        joined += ",";
++        joined += addresses[i];
++    }
++    return joined;
++}
++
++std::string BuildWebSocketUrl(const std::string& address, uint16_t port, const std::string& path) {
++    return "ws://" + address + ":" + std::to_string(port) + path;
++}
++
++ExtractedGatewayCandidates ExtractGatewayCandidatesFromMdnsResults(const mdns_result_t* results,
++                                                                   int result_count) {
++    ExtractedGatewayCandidates extracted;
++    for (const mdns_result_t* result = results; result != nullptr; result = result->next) {
++        std::string instance_name = SafeString(result->instance_name);
++        std::string hostname = SafeString(result->hostname);
++
++        auto version = TxtValue(result, "version");
++        if (version.has_value() && *version != "1") {
++            ESP_LOGI(TAG,
++                     "Skipping mDNS gateway instance=\"%s\" host=\"%s\": unsupported TXT version=\"%s\"",
++                     instance_name.c_str(), hostname.c_str(), version->c_str());
++            continue;
++        }
++
++        if (result->port == 0) {
++            ESP_LOGW(TAG, "Skipping mDNS gateway instance=\"%s\" host=\"%s\": zero port",
++                     instance_name.c_str(), hostname.c_str());
++            continue;
++        }
++
++        auto addresses = UsableIpv4Addresses(result);
++        if (addresses.empty()) {
++            ESP_LOGI(TAG, "Skipping mDNS gateway instance=\"%s\" host=\"%s\": no usable IPv4 address",
++                     instance_name.c_str(), hostname.c_str());
++            continue;
++        }
++
++        std::string path = NormalizePath(TxtValue(result, "path"));
++        ESP_LOGI(TAG,
++                 "Accepting mDNS gateway instance=\"%s\" host=\"%s\" port=%u path=\"%s\" addresses=%s",
++                 instance_name.c_str(), hostname.c_str(),
++                 static_cast<unsigned>(result->port), path.c_str(),
++                 JoinAddresses(addresses).c_str());
++        ++extracted.accepted_instances;
++        for (const auto& address : addresses) {
++            MdnsGatewayCandidate candidate;
++            candidate.url = BuildWebSocketUrl(address, result->port, path);
++            candidate.instance_name = instance_name;
++            candidate.hostname = hostname;
++            candidate.address = address;
++            candidate.port = result->port;
++            candidate.path = path;
++            candidate.result_count = result_count;
++            extracted.candidates.push_back(candidate);
++        }
++    }
++    return extracted;
++}
++
++}  // namespace stackchan::mdns
+diff --git a/main/porting_extras/extras/mdns/mdns_candidate_extract.h b/main/porting_extras/extras/mdns/mdns_candidate_extract.h
+new file mode 100644
+index 0000000..f2e1cb5
+--- /dev/null
++++ b/main/porting_extras/extras/mdns/mdns_candidate_extract.h
+@@ -0,0 +1,24 @@
++#ifndef _MDNS_CANDIDATE_EXTRACT_H_
++#define _MDNS_CANDIDATE_EXTRACT_H_
++
++#include "mdns_gateway_discovery.h"
++
++#include <mdns.h>
++
++#include <vector>
++
++namespace stackchan::mdns {
++
++struct ExtractedGatewayCandidates {
++    int accepted_instances = 0;
++    std::vector<MdnsGatewayCandidate> candidates;
++};
++
++int CountResults(const mdns_result_t* results);
++
++ExtractedGatewayCandidates ExtractGatewayCandidatesFromMdnsResults(const mdns_result_t* results,
++                                                                   int result_count);
++
++}  // namespace stackchan::mdns
++
++#endif  // _MDNS_CANDIDATE_EXTRACT_H_
+diff --git a/main/porting_extras/extras/mdns/mdns_gateway_discovery.cc b/main/porting_extras/extras/mdns/mdns_gateway_discovery.cc
+new file mode 100644
+index 0000000..6941540
+--- /dev/null
++++ b/main/porting_extras/extras/mdns/mdns_gateway_discovery.cc
+@@ -0,0 +1,144 @@
++#include "mdns_gateway_discovery.h"
++
++#include <esp_log.h>
++
++#include <utility>
++#include <vector>
++
++#if CONFIG_STACKCHAN_MDNS_DISCOVERY
++#include "mdns_candidate_extract.h"
++
++#include <esp_err.h>
++#include <esp_wifi.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <mdns.h>
++#endif
++
++#define TAG "WS"
++
++namespace {
++
++constexpr char kServiceType[] = "_stackchan-mcp";
++constexpr char kProtocol[] = "_tcp";
++constexpr size_t kMaxResults = 8;
++
++#if CONFIG_STACKCHAN_MDNS_DISCOVERY
++
++constexpr int kQueryAttempts = 3;
++constexpr uint32_t kQueryRetryGapMs = 200;
++
++std::string JoinCandidateAddresses(const std::vector<MdnsGatewayCandidate>& candidates) {
++    if (candidates.empty()) {
++        return std::string();
++    }
++    std::string joined = candidates.front().address;
++    for (size_t i = 1; i < candidates.size(); ++i) {
++        joined += ",";
++        joined += candidates[i].address;
++    }
++    return joined;
++}
++
++#endif  // CONFIG_STACKCHAN_MDNS_DISCOVERY
++
++}  // namespace
++
++std::optional<std::vector<MdnsGatewayCandidate>> DiscoverStackchanGateway(uint32_t timeout_ms) {
++#if CONFIG_STACKCHAN_MDNS_DISCOVERY
++    mdns_result_t* results = nullptr;
++    esp_err_t err = mdns_init();
++    if (err != ESP_OK) {
++        ESP_LOGW(TAG, "mDNS discovery unavailable: mdns_init failed: %s", esp_err_to_name(err));
++        return std::nullopt;
++    }
++
++    wifi_ps_type_t previous_ps_mode = WIFI_PS_MIN_MODEM;
++    esp_err_t ps_get_err = esp_wifi_get_ps(&previous_ps_mode);
++    if (ps_get_err != ESP_OK) {
++        ESP_LOGW(TAG, "Failed to read WiFi power-save mode before mDNS browse: %s",
++                 esp_err_to_name(ps_get_err));
++    }
++
++    esp_err_t ps_set_err = esp_wifi_set_ps(WIFI_PS_NONE);
++    if (ps_set_err != ESP_OK) {
++        ESP_LOGW(TAG, "Failed to disable WiFi power-save during mDNS browse: %s",
++                 esp_err_to_name(ps_set_err));
++    }
++
++    auto restore_wifi_power_save = [&]() {
++        esp_err_t ps_restore_err = esp_wifi_set_ps(previous_ps_mode);
++        if (ps_restore_err != ESP_OK) {
++            ESP_LOGW(TAG, "Failed to restore WiFi power-save mode after mDNS browse: %s",
++                     esp_err_to_name(ps_restore_err));
++        }
++    };
++
++    for (int attempt = 0; attempt < kQueryAttempts; ++attempt) {
++        if (attempt > 0) {
++            vTaskDelay(pdMS_TO_TICKS(kQueryRetryGapMs));
++        }
++
++        err = mdns_query_ptr(kServiceType, kProtocol, timeout_ms, kMaxResults, &results);
++        if (err == ESP_OK && results != nullptr) {
++            break;
++        }
++
++        if (results != nullptr) {
++            mdns_query_results_free(results);
++            results = nullptr;
++        }
++        ESP_LOGI(TAG, "mDNS query attempt %d/%d returned no results",
++                 attempt + 1, kQueryAttempts);
++    }
++
++    if (err != ESP_OK) {
++        ESP_LOGW(TAG, "mDNS gateway query failed after %d attempts: %s",
++                 kQueryAttempts, esp_err_to_name(err));
++        if (results != nullptr) {
++            mdns_query_results_free(results);
++        }
++        restore_wifi_power_save();
++        mdns_free();
++        return std::nullopt;
++    }
++
++    int result_count = stackchan::mdns::CountResults(results);
++    // Keep the count next to the extracted candidates so summary logs stay
++    // accurate without a mutable out-parameter.
++    auto extracted = stackchan::mdns::ExtractGatewayCandidatesFromMdnsResults(results, result_count);
++    std::optional<std::vector<MdnsGatewayCandidate>> all_candidates;
++    if (!extracted.candidates.empty()) {
++        all_candidates = std::move(extracted.candidates);
++    }
++
++    if (all_candidates.has_value()) {
++        std::string addresses = JoinCandidateAddresses(*all_candidates);
++        // Cast size_t to unsigned int and use %u to stay nano-printf-safe
++        // (newlib-nano in ESP-IDF does not handle %zu; the misaligned arg
++        // would then read the size_t as a string pointer and crash). Same
++        // pattern as firmware/main/boards/stackchan/avatar_set_fetcher.cc.
++        ESP_LOGI(TAG,
++                 "mDNS gateway browse complete: raw_results=%d accepted_instances=%d candidates=%u addresses=%s",
++                 result_count,
++                 extracted.accepted_instances,
++                 static_cast<unsigned int>(all_candidates->size()),
++                 addresses.c_str());
++    } else if (result_count == 0) {
++        ESP_LOGI(TAG, "No mDNS stackchan gateway services discovered");
++    } else {
++        ESP_LOGW(TAG, "mDNS gateway browse found %d result(s), but no supported gateway candidates",
++                 result_count);
++    }
++
++    if (results != nullptr) {
++        mdns_query_results_free(results);
++    }
++    restore_wifi_power_save();
++    mdns_free();
++    return all_candidates;
++#else
++    (void)timeout_ms;
++    return std::nullopt;
++#endif
++}
+diff --git a/main/porting_extras/extras/mdns/mdns_gateway_discovery.h b/main/porting_extras/extras/mdns/mdns_gateway_discovery.h
+new file mode 100644
+index 0000000..d9a8529
+--- /dev/null
++++ b/main/porting_extras/extras/mdns/mdns_gateway_discovery.h
+@@ -0,0 +1,24 @@
++#ifndef _MDNS_GATEWAY_DISCOVERY_H_
++#define _MDNS_GATEWAY_DISCOVERY_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++struct MdnsGatewayCandidate {
++    std::string url;
++    std::string instance_name;
++    std::string hostname;
++    std::string address;
++    uint16_t port = 0;
++    std::string path = "/";
++    int result_count = 0;
++};
++
++// Returns one candidate per usable IPv4 address for all supported gateway
++// services discovered in one mDNS browse. std::nullopt means no supported
++// gateway was discovered.
++std::optional<std::vector<MdnsGatewayCandidate>> DiscoverStackchanGateway(uint32_t timeout_ms);
++
++#endif  // _MDNS_GATEWAY_DISCOVERY_H_
+diff --git a/main/porting_extras/feetech_scs/CMakeLists.txt b/main/porting_extras/feetech_scs/CMakeLists.txt
+new file mode 100644
+index 0000000..31fa8e1
+--- /dev/null
++++ b/main/porting_extras/feetech_scs/CMakeLists.txt
+@@ -0,0 +1,5 @@
++idf_component_register(
++    SRCS        "feetech_scs.cpp"
++    INCLUDE_DIRS "."
++    REQUIRES    driver
++)
+diff --git a/main/porting_extras/feetech_scs/LICENSE b/main/porting_extras/feetech_scs/LICENSE
+new file mode 100644
+index 0000000..ad3cc4f
+--- /dev/null
++++ b/main/porting_extras/feetech_scs/LICENSE
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 necobit
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/main/porting_extras/feetech_scs/README.md b/main/porting_extras/feetech_scs/README.md
+new file mode 100644
+index 0000000..4a8ced5
+--- /dev/null
++++ b/main/porting_extras/feetech_scs/README.md
+@@ -0,0 +1,70 @@
++# feetech_scs (vendored)
++
++MIT-licensed Feetech SCS0009 / SCSCL serial servo driver for ESP-IDF, vendored
++from upstream as a clean-room alternative to the GPL-3.0 `SCServo_lib` shipped
++in `firmware/main/boards/stackchan/`.
++
++## Source
++
++- Upstream: <https://github.com/necobit/feetech_scs_esp_idf>
++- Commit:   `38a91984be0d30abbff30d2f56dd3072f2905faf` (initial provisional
++            release, 2026-05-10)
++- License:  MIT — see `LICENSE` in this directory (verbatim copy of upstream
++            `LICENSE`).
++
++The upstream source header (`feetech_scs.cpp`) explicitly states the
++implementation is a **clean-room reimplementation from the public Feetech
++SCS0009 datasheet** with **no code derived from the GPLv3 SCServo_lib**.
++
++## Local modifications
++
++This vendor copy is **not byte-for-byte identical** to upstream. The
++following local patches have been applied; each is planned to be sent
++back to upstream as an Issue/PR once real-device validation is complete:
++
++1. **`uart_wait_tx_done()` between TX and RX in `write_reg` / `read_reg`**
++   ([#79](https://github.com/kisaragi-mochi/stackchan-mcp/issues/79)).
++   Upstream starts reading the bus immediately after `uart_write_bytes`,
++   which only enqueues the bytes into the UART driver buffer. On a
++   half-duplex servo bus this lets our own outgoing bytes clip the ACK
++   packet and produces spurious bus-error returns. The original
++   `SCServo_lib` mirrors a TX-drain wait via
++   `SCSerial::wFlushSCS` (`uart_wait_tx_done(..., 100ms)`); we
++   reproduce that here. Tagged in the source with
++   `// Local patch (issue #79):` markers for easy diffing against
++   upstream.
++
++The `LICENSE` file remains verbatim from upstream — MIT license
++attribution is preserved.
++
++## Why vendored
++
++The upstream project is currently in provisional release state. Vendoring a
++pinned commit lets us:
++
++1. Audit the exact bytes that ship in firmware builds.
++2. Iterate on integration locally (Kconfig, build glue) without waiting for
++   upstream changes.
++3. Feed verification findings back upstream as Issues / PRs.
++
++Once upstream stabilizes, this can be migrated to a `submodule` or
++`idf_component.yml` managed dependency.
++
++## Updating
++
++To refresh this vendor copy from upstream:
++
++```bash
++cd firmware/components/feetech_scs
++curl -L https://raw.githubusercontent.com/necobit/feetech_scs_esp_idf/<sha>/feetech_scs.h -o feetech_scs.h
++curl -L https://raw.githubusercontent.com/necobit/feetech_scs_esp_idf/<sha>/feetech_scs.cpp -o feetech_scs.cpp
++curl -L https://raw.githubusercontent.com/necobit/feetech_scs_esp_idf/<sha>/CMakeLists.txt -o CMakeLists.txt
++curl -L https://raw.githubusercontent.com/necobit/feetech_scs_esp_idf/<sha>/LICENSE -o LICENSE
++```
++
++Update the commit SHA in this README's "Source" section to match.
++
++## Tracking issue
++
++See [`#79`](https://github.com/kisaragi-mochi/stackchan-mcp/issues/79) for the
++evaluation status, validation plan, and migration roadmap to MIT-only firmware.
+diff --git a/main/porting_extras/feetech_scs/feetech_scs.cpp b/main/porting_extras/feetech_scs/feetech_scs.cpp
+new file mode 100644
+index 0000000..bda0fae
+--- /dev/null
++++ b/main/porting_extras/feetech_scs/feetech_scs.cpp
+@@ -0,0 +1,231 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Clean-room reimplementation of the SCSCL protocol layer from the public
++ * Feetech SCS0009 datasheet. No code from the GPLv3 SCServo_lib is used.
++ */
++#include "feetech_scs.h"
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <esp_log.h>
++#include <cstring>
++#include <algorithm>
++
++static const char* TAG = "FeetechScs";
++
++namespace {
++
++// SCSCL register addresses (from the public datasheet).
++constexpr uint8_t REG_OPERATION_MODE   = 33;  // 0x21 — 0=Position, 1=PWM
++constexpr uint8_t REG_TORQUE_ENABLE    = 40;  // 0x28
++constexpr uint8_t REG_GOAL_POSITION_L  = 42;  // 0x2A — followed by H, time L/H, speed L/H
++constexpr uint8_t REG_GOAL_SPEED_L     = 46;  // 0x2E — also PWM target in PWM mode
++constexpr uint8_t REG_PRESENT_POSITION_L = 56;  // 0x38
++constexpr uint8_t REG_MOVING           = 66;  // 0x42
++
++// Protocol instruction codes.
++constexpr uint8_t INST_READ  = 0x02;
++constexpr uint8_t INST_WRITE = 0x03;
++
++// Hard physical limits enforced inside this driver. The caller is expected
++// to have already clamped to its own application limits, but we re-check
++// here so a bug upstream can't accidentally drive the servo past the
++// register range and physically damage the rig.
++constexpr uint16_t HARD_POS_MAX = 1023;
++constexpr int16_t  HARD_PWM_ABS_MAX = 1023;
++
++// Bus response timeout. 1 Mbps × 8 bytes ≈ 80 µs; 20 ms is plenty.
++constexpr TickType_t RX_TIMEOUT = pdMS_TO_TICKS(20);
++
++uint8_t calc_checksum(const uint8_t* buf, size_t len)
++{
++    // Sum of bytes from ID through last param (i.e. skip the two header
++    // 0xFF bytes), inverted.
++    uint32_t sum = 0;
++    for (size_t i = 2; i < len; i++) sum += buf[i];
++    return static_cast<uint8_t>(~sum & 0xFF);
++}
++
++}  // namespace
++
++void FeetechScs::begin(uart_port_t uart, int baud, int tx_pin, int rx_pin)
++{
++    if (_ready && _uart == uart) return;
++
++    _uart = uart;
++
++    uart_config_t cfg = {};
++    cfg.baud_rate     = baud;
++    cfg.data_bits     = UART_DATA_8_BITS;
++    cfg.parity        = UART_PARITY_DISABLE;
++    cfg.stop_bits     = UART_STOP_BITS_1;
++    cfg.flow_ctrl     = UART_HW_FLOWCTRL_DISABLE;
++    cfg.source_clk    = UART_SCLK_DEFAULT;
++
++    ESP_ERROR_CHECK(uart_param_config(uart, &cfg));
++    ESP_ERROR_CHECK(uart_set_pin(uart, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
++    if (!uart_is_driver_installed(uart)) {
++        ESP_ERROR_CHECK(uart_driver_install(uart, 256, 0, 0, nullptr, 0));
++    }
++
++    _ready = true;
++    ESP_LOGI(TAG, "begin uart=%d baud=%d tx=%d rx=%d", (int)uart, baud, tx_pin, rx_pin);
++}
++
++int FeetechScs::write_reg(uint8_t id, uint8_t addr, const uint8_t* data, uint8_t n)
++{
++    if (!_ready) return -1;
++
++    // 0xFF 0xFF ID LEN INST ADDR PARAMS... CHK
++    // LEN = (ADDR + PARAMS + CHK + INST) -> = n + 3
++    uint8_t buf[16];
++    if (n + 7 > sizeof(buf)) return -1;  // safety bound — we never write more than 6 params
++
++    buf[0] = 0xFF;
++    buf[1] = 0xFF;
++    buf[2] = id;
++    buf[3] = static_cast<uint8_t>(n + 3);
++    buf[4] = INST_WRITE;
++    buf[5] = addr;
++    if (data && n) std::memcpy(&buf[6], data, n);
++    size_t total = 6 + n;
++    buf[total]   = calc_checksum(buf, total);
++    total += 1;
++
++    uart_flush_input(_uart);
++    int written = uart_write_bytes(_uart, reinterpret_cast<const char*>(buf), total);
++    if (written != (int)total) return -1;
++
++    // Local patch (issue #79): wait for TX to drain off the wire before
++    // reading the half-duplex bus, mirroring the upstream SCServo_lib's
++    // SCSerial::wFlushSCS (uart_wait_tx_done with 100ms timeout). Without
++    // this, our own outgoing bytes can clip the incoming ACK packet and
++    // surface as spurious bus errors.
++    if (uart_wait_tx_done(_uart, pdMS_TO_TICKS(100)) != ESP_OK) return -1;
++
++    // Wait for status reply (0xFF 0xFF ID LEN ERR CHK = 6 bytes total) when
++    // not broadcasting. Broadcast (id=0xFE) does not get a reply.
++    if (id == 0xFE) return 0;
++
++    uint8_t reply[6] = {};
++    int got          = uart_read_bytes(_uart, reply, sizeof(reply), RX_TIMEOUT);
++    if (got != (int)sizeof(reply))                  return -1;
++    if (reply[0] != 0xFF || reply[1] != 0xFF)       return -1;
++    if (reply[2] != id)                             return -1;
++    if (reply[3] != 2)                              return -1;
++    uint8_t exp_chk = static_cast<uint8_t>(~(reply[2] + reply[3] + reply[4]) & 0xFF);
++    if (reply[5] != exp_chk)                        return -1;
++    return 0;
++}
++
++int FeetechScs::read_reg(uint8_t id, uint8_t addr, uint8_t n, uint8_t* out)
++{
++    if (!_ready || !out || n == 0) return -1;
++
++    // 0xFF 0xFF ID LEN(=4) INST(=2) ADDR N CHK
++    uint8_t buf[8];
++    buf[0] = 0xFF;
++    buf[1] = 0xFF;
++    buf[2] = id;
++    buf[3] = 4;
++    buf[4] = INST_READ;
++    buf[5] = addr;
++    buf[6] = n;
++    buf[7] = calc_checksum(buf, 7);
++
++    uart_flush_input(_uart);
++    int written = uart_write_bytes(_uart, reinterpret_cast<const char*>(buf), 8);
++    if (written != 8) return -1;
++
++    // Local patch (issue #79): same TX-drain wait as write_reg() — see
++    // the comment there for the rationale.
++    if (uart_wait_tx_done(_uart, pdMS_TO_TICKS(100)) != ESP_OK) return -1;
++
++    // Reply: 0xFF 0xFF ID LEN(=2+n) ERR DATA[n] CHK
++    const size_t reply_len = 6u + n;
++    uint8_t reply[16] = {};
++    if (reply_len > sizeof(reply)) return -1;
++    int got = uart_read_bytes(_uart, reply, reply_len, RX_TIMEOUT);
++    if (got != (int)reply_len)                            return -1;
++    if (reply[0] != 0xFF || reply[1] != 0xFF)             return -1;
++    if (reply[2] != id)                                   return -1;
++    if (reply[3] != static_cast<uint8_t>(n + 2))          return -1;
++
++    uint32_t sum = reply[2] + reply[3] + reply[4];
++    for (uint8_t i = 0; i < n; i++) sum += reply[5 + i];
++    uint8_t exp_chk = static_cast<uint8_t>(~sum & 0xFF);
++    if (reply[reply_len - 1] != exp_chk)                  return -1;
++
++    std::memcpy(out, &reply[5], n);
++    return 0;
++}
++
++int FeetechScs::WritePos(uint8_t id, uint16_t position, uint16_t time_ms, uint16_t speed)
++{
++    // Defensive clamp — protects the mech if any caller forgets to clamp.
++    if (position > HARD_POS_MAX) position = HARD_POS_MAX;
++
++    // SCSCL series stores 16-bit registers BIG-endian over the wire: the
++    // byte at the lower register address (`*_L`) is actually the *high*
++    // byte of the word. (The naming in the datasheet is "L = low address",
++    // not "low byte" — easy to misread.) Sending little-endian made the
++    // servo see a huge value and clamp to the mechanical maximum.
++    uint8_t params[6] = {
++        static_cast<uint8_t>((position >> 8) & 0xFF),
++        static_cast<uint8_t>(position & 0xFF),
++        static_cast<uint8_t>((time_ms >> 8) & 0xFF),
++        static_cast<uint8_t>(time_ms & 0xFF),
++        static_cast<uint8_t>((speed >> 8) & 0xFF),
++        static_cast<uint8_t>(speed & 0xFF),
++    };
++    return write_reg(id, REG_GOAL_POSITION_L, params, 6);
++}
++
++int FeetechScs::ReadPos(uint8_t id)
++{
++    uint8_t b[2];
++    if (read_reg(id, REG_PRESENT_POSITION_L, 2, b) != 0) return -1;
++    // Big-endian: byte at lower address is the high byte (see WritePos comment).
++    return (b[0] << 8) | b[1];
++}
++
++int FeetechScs::ReadMove(uint8_t id)
++{
++    uint8_t b;
++    if (read_reg(id, REG_MOVING, 1, &b) != 0) return -1;
++    return b;
++}
++
++int FeetechScs::EnableTorque(uint8_t id, uint8_t enable)
++{
++    uint8_t v = enable ? 1 : 0;
++    return write_reg(id, REG_TORQUE_ENABLE, &v, 1);
++}
++
++int FeetechScs::ReadToqueEnable(uint8_t id)
++{
++    uint8_t b;
++    if (read_reg(id, REG_TORQUE_ENABLE, 1, &b) != 0) return -1;
++    return b;
++}
++
++int FeetechScs::SwitchMode(uint8_t id, uint8_t mode)
++{
++    uint8_t v = (mode == 0) ? 0 : 1;
++    return write_reg(id, REG_OPERATION_MODE, &v, 1);
++}
++
++int FeetechScs::WritePWM(uint8_t id, int16_t pwm)
++{
++    if (pwm >  HARD_PWM_ABS_MAX) pwm =  HARD_PWM_ABS_MAX;
++    if (pwm < -HARD_PWM_ABS_MAX) pwm = -HARD_PWM_ABS_MAX;
++    // SCS0009 PWM word: low 10 bits = magnitude, bit 10 = direction.
++    uint16_t mag = static_cast<uint16_t>(pwm < 0 ? -pwm : pwm) & 0x03FF;
++    uint16_t v   = mag | (pwm < 0 ? 0x0400 : 0x0000);
++    // Big-endian word — see WritePos for the byte-order rationale.
++    uint8_t params[2] = {
++        static_cast<uint8_t>((v >> 8) & 0xFF),
++        static_cast<uint8_t>(v & 0xFF),
++    };
++    return write_reg(id, REG_GOAL_SPEED_L, params, 2);
++}
+diff --git a/main/porting_extras/feetech_scs/feetech_scs.h b/main/porting_extras/feetech_scs/feetech_scs.h
+new file mode 100644
+index 0000000..bbce188
+--- /dev/null
++++ b/main/porting_extras/feetech_scs/feetech_scs.h
+@@ -0,0 +1,71 @@
++/*
++ * MIT-licensed minimal driver for Feetech SCS0009 / SCSCL serial servos.
++ *
++ * Implements only the seven calls our ScsServo wrapper actually uses, with
++ * the same signatures as the upstream SCServo_lib SCSCL class so the rest
++ * of the firmware doesn't change. Designed as a clean-room reimplementation
++ * from the public protocol spec — does not contain any code derived from
++ * the GPLv3 SCServo_lib.
++ *
++ * Protocol (Dynamixel 1.0-compatible half-duplex UART, 1 Mbps default):
++ *   Packet:  0xFF 0xFF ID LEN INST PARAMS... CHK
++ *   CHK = ~(ID + LEN + INST + Σ PARAMS) & 0xFF
++ *
++ * Register map references (all from the public SCS0009 / SCSCL datasheet):
++ *   0x21 (33)  Operation mode      — 0=Position, 1=PWM
++ *   0x28 (40)  Torque enable       — 0=off, 1=on
++ *   0x2A (42)  Goal position L/H   — u16 (0..1023)
++ *   0x2C (44)  Goal time L/H       — u16 (ms)
++ *   0x2E (46)  Goal speed L/H      — u16 (also used as PWM target in PWM mode,
++ *                                          bit 10 = direction)
++ *   0x38 (56)  Present position L/H — u16
++ *   0x42 (66)  Moving               — u8 (1 = still moving)
++ *
++ * Safety: every WritePos / WritePWM clamps its inputs to physical limits
++ * before sending, so a caller that forgets to clamp can't drive the servo
++ * past 0..1023 or PWM beyond ±1023.
++ */
++#pragma once
++#include <cstdint>
++#include <driver/uart.h>
++
++class FeetechScs {
++public:
++    // One-time UART init. Idempotent — calling it twice on the same port
++    // is a no-op.
++    void begin(uart_port_t uart, int baud, int tx_pin, int rx_pin);
++
++    // ---- Position-mode commands -------------------------------------------
++    // Goal position 0..1023, time 0..65535 ms, speed 0..65535 (0 = max).
++    int WritePos(uint8_t id, uint16_t position, uint16_t time_ms, uint16_t speed);
++
++    // Returns 0..1023 on success, -1 on timeout / checksum error.
++    int ReadPos(uint8_t id);
++
++    // Returns 1 if the servo is still moving, 0 if at rest, -1 on bus error.
++    int ReadMove(uint8_t id);
++
++    // ---- Torque ---------------------------------------------------------
++    int EnableTorque(uint8_t id, uint8_t enable);
++    int ReadToqueEnable(uint8_t id);  // typo preserved for SCSCL API parity
++
++    // ---- PWM / wheel mode ------------------------------------------------
++    // Switch operation mode. 0 = position, 1 = PWM.
++    int SwitchMode(uint8_t id, uint8_t mode);
++
++    // PWM output, signed -1023..1023. Bit 10 of the on-wire value carries
++    // sign per the SCS0009 spec. SwitchMode(id, 1) must be called first.
++    int WritePWM(uint8_t id, int16_t pwm);
++
++private:
++    uart_port_t _uart  = UART_NUM_1;
++    bool        _ready = false;
++
++    // Build & send a WRITE_DATA packet (INST=0x03). data may be nullptr if
++    // n == 0.  Returns 0 on ACK, -1 on bus error.
++    int write_reg(uint8_t id, uint8_t addr, const uint8_t* data, uint8_t n);
++
++    // Build & send a READ_DATA packet (INST=0x02). Reads n bytes into out.
++    // Returns 0 on success, -1 on bus / checksum error.
++    int read_reg(uint8_t id, uint8_t addr, uint8_t n, uint8_t* out);
++};

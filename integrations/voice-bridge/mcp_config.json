@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "workbuddy": {
+      "command": "python3",
+      "args": ["server_workbuddy.py"]
+    }
+  }
+}

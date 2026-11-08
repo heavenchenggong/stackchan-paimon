@@ -1,0 +1,107 @@
+From 7bb8f58f2a94cfe30a3c2734a74d2429f38b6569 Mon Sep 17 00:00:00 2001
+From: WorkBuddy <workbuddy@example.com>
+Date: Sun, 8 Nov 2026 12:24:25 +0800
+Subject: [PATCH 5/6] fix(led): configure PY32 GPIO13 before LED writes (root
+ cause)
+
+PY32 drives the 12x WS2812C strip from its own GPIO13. The board only wrote
+LED count (0x24) and cleared the frame, never configuring the pin, so I2C
+reads/writes and register readback all succeeded while the strip never
+changed colour.
+
+Port the M5 BSP / stackchan sequence:
+  SetDirection(13, output) -> SetPullMode(13, pull-up) -> SetDriveMode(13,
+  push-pull) -> SetLedCount(12) -> 200ms settle -> clear frame -> latch.
+
+Also expose gpio13_output / gpio13_pullup / gpio13_pushpull and raw 0x04 /
+0x0a / 0x14 values in self.led.status for future diagnosis.
+---
+ .../boards/m5stack-core-s3/m5stack_core_s3.cc | 55 ++++++++++++++++---
+ 1 file changed, 48 insertions(+), 7 deletions(-)
+
+diff --git a/main/boards/m5stack-core-s3/m5stack_core_s3.cc b/main/boards/m5stack-core-s3/m5stack_core_s3.cc
+index 4bd0008..ca2ab63 100644
+--- a/main/boards/m5stack-core-s3/m5stack_core_s3.cc
++++ b/main/boards/m5stack-core-s3/m5stack_core_s3.cc
+@@ -1569,6 +1569,15 @@ private:
+     //   REG_LED_CFG  (0x24): 低6位=LED数量, bit6=1 触发刷新
+     //   REG_LED_RAM  (0x30+): 颜色数据起点，每颗 LED 2 字节 RGB565 little-endian
+ 
++    // 单 bit 读改写：pin 0-7 用 low 寄存器，8-15 用 high 寄存器。
++    bool Py32WriteBit(uint8_t reg, uint8_t bit, bool value) {
++        uint8_t v = 0;
++        if (!Py32ReadReg(reg, &v)) return false;
++        if (value) v |= (uint8_t)(1u << bit);
++        else       v &= (uint8_t)~(1u << bit);
++        return Py32WriteRegBlock(reg, &v, 1);
++    }
++
+     void InitializePy32LedDevice() {
+         i2c_device_config_t dev_cfg = {
+             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+@@ -1580,12 +1589,33 @@ private:
+             py32_dev_ = nullptr;
+             return;
+         }
+-        // 设 LED 数量 = 12
+-        uint8_t cmd[2] = {0x24, 12};
+-        i2c_master_transmit(py32_dev_, cmd, 2, 200);
++
++        // 🔴 只写 LED 数量是不够的：WS2812 数据线接在 PY32 的 GPIO13，
++        // 必须先把该脚配成「输出 + 上拉 + push-pull」，PY32 内部的 LED 引擎
++        // 才会把 RAM 里的颜色推到灯带上。顺序照 M5 BSP / stackchan 上游：
++        //   SetDirection(13) -> SetPullMode(13, up) -> SetDriveMode(13, push-pull)
++        //   -> SetLedCount(12) -> 200ms settle -> 清帧 -> latch
++        // 缺了前三步时，I2C 读写全部成功、寄存器回读也正确，但灯就是不变色。
++        bool ok_dir = Py32WriteBit(0x04, 5, true);   // GPIO13 = output
++        bool ok_pu  = Py32WriteBit(0x0A, 5, true);   // pull-up on
++        bool ok_pd  = Py32WriteBit(0x0C, 5, false);  // pull-down off
++        bool ok_drv = Py32WriteBit(0x14, 5, false);  // push-pull
++        uint8_t led_count = 12;
++        bool ok_cnt = Py32WriteRegBlock(0x24, &led_count, 1);
++        if (!ok_dir || !ok_pu || !ok_pd || !ok_drv || !ok_cnt) {
++            ESP_LOGE(TAG, "PY32 RGB init FAILED: dir=%d pu=%d pd=%d drv=%d cnt=%d",
++                     ok_dir, ok_pu, ok_pd, ok_drv, ok_cnt);
++            return;
++        }
++        // PY32 内部 LED 引擎在 SetLedCount 之后需要约 200ms 稳定
++        vTaskDelay(pdMS_TO_TICKS(200));
++
+         uint16_t off[12] = {};
+-        Py32SetLedFrame(off, 12);
+-        ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, off)");
++        if (!Py32SetLedFrame(off, 12)) {
++            ESP_LOGE(TAG, "PY32 RGB clear FAILED (I2C)");
++            return;
++        }
++        ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, GPIO13 push-pull, off)");
+     }
+ 
+     // PY32 在内部刷 WS2812 时会短暂不响应 I2C，单次写经常 NACK。
+@@ -1995,13 +2025,24 @@ private:
+             "the first LED's RGB565 bytes (0x30/0x31), and the manual/pattern state.",
+             PropertyList(),
+             [this](const PropertyList&) -> ReturnValue {
+-                uint8_t cfg = 0, lo = 0, hi = 0;
++                uint8_t cfg = 0, lo = 0, hi = 0, dir = 0, pu = 0, drv = 0;
+                 bool ok_cfg = Py32ReadReg(0x24, &cfg);
+                 bool ok_ram = Py32ReadReg(0x30, &lo) && Py32ReadReg(0x31, &hi);
++                bool ok_gpio = Py32ReadReg(0x04, &dir) && Py32ReadReg(0x0A, &pu) &&
++                               Py32ReadReg(0x14, &drv);
+                 uint16_t rgb565 = (uint16_t)lo | ((uint16_t)hi << 8);
+-                return std::string("{\"i2c_ok\":") + (ok_cfg && ok_ram ? "true" : "false") +
++                bool pin13_out = (dir & 0x20) != 0;
++                bool pin13_pullup = (pu & 0x20) != 0;
++                bool pin13_pp = (drv & 0x20) == 0;
++                return std::string("{\"i2c_ok\":") + (ok_cfg && ok_ram && ok_gpio ? "true" : "false") +
+                        ",\"cfg_0x24\":" + std::to_string(cfg) +
+                        ",\"led0_rgb565\":" + std::to_string(rgb565) +
++                       ",\"gpio13_output\":" + (pin13_out ? "true" : "false") +
++                       ",\"gpio13_pullup\":" + (pin13_pullup ? "true" : "false") +
++                       ",\"gpio13_pushpull\":" + (pin13_pp ? "true" : "false") +
++                       ",\"dir_0x04\":" + std::to_string(dir) +
++                       ",\"pu_0x0a\":" + std::to_string(pu) +
++                       ",\"drv_0x14\":" + std::to_string(drv) +
+                        ",\"manual\":" + (led_manual_ ? "true" : "false") +
+                        ",\"pattern\":\"" + led_pattern_ + "\"}";
+             });

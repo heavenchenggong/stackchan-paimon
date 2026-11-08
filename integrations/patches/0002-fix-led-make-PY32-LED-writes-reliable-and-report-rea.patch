@@ -1,0 +1,189 @@
+From c1e6131e348e6d1925bd910aba1ebf2e4d732b7c Mon Sep 17 00:00:00 2001
+From: WorkBuddy <workbuddy@example.com>
+Date: Sun, 8 Nov 2026 10:52:23 +0800
+Subject: [PATCH 2/6] fix(led): make PY32 LED writes reliable and report real
+ I2C result
+
+- Py32WriteRegBlock / new Py32ReadReg: 5 retries with 2ms backoff, matching
+  upstream stackchan SafeWriteReg. PY32 NACKs while refreshing its WS2812
+  engine; a single write silently failed before.
+- Py32SetLedFrame: latch 0x24 with read-modify-write (cfg | bit6) instead of
+  blindly writing count|0x40, preserving count and high bits.
+- All self.led.* tools now return the real Py32SetLedFrame result instead of
+  unconditional true; failures return an explicit error string.
+- self.led.pattern writes the first frame synchronously and aborts if I2C fails.
+- add self.led.status diagnostic tool (read back 0x24 / 0x30 / 0x31 + state).
+---
+ .../boards/m5stack-core-s3/m5stack_core_s3.cc | 85 ++++++++++++++++---
+ 1 file changed, 71 insertions(+), 14 deletions(-)
+
+diff --git a/main/boards/m5stack-core-s3/m5stack_core_s3.cc b/main/boards/m5stack-core-s3/m5stack_core_s3.cc
+index 0ac8744..4bd0008 100644
+--- a/main/boards/m5stack-core-s3/m5stack_core_s3.cc
++++ b/main/boards/m5stack-core-s3/m5stack_core_s3.cc
+@@ -1588,13 +1588,31 @@ private:
+         ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, off)");
+     }
+ 
++    // PY32 在内部刷 WS2812 时会短暂不响应 I2C，单次写经常 NACK。
++    // 上游 stackchan 的 SafeWriteReg / SafeReadReg 都带重试，这里对齐：
++    // 5 次 + 2ms 退避，失败打日志（以前静默丢掉，工具还照样返回 true）。
+     bool Py32WriteRegBlock(uint8_t reg, const uint8_t* data, size_t len) {
+         if (!py32_dev_) return false;
+         static uint8_t buf[80];
+         if (len + 1 > sizeof(buf)) return false;
+         buf[0] = reg;
+         memcpy(buf + 1, data, len);
+-        return i2c_master_transmit(py32_dev_, buf, len + 1, 200) == ESP_OK;
++        for (int attempt = 0; attempt < 5; ++attempt) {
++            if (i2c_master_transmit(py32_dev_, buf, len + 1, 200) == ESP_OK) return true;
++            vTaskDelay(pdMS_TO_TICKS(2));
++        }
++        ESP_LOGW(TAG, "PY32: write reg 0x%02X failed after 5 tries", reg);
++        return false;
++    }
++
++    bool Py32ReadReg(uint8_t reg, uint8_t* value) {
++        if (!py32_dev_ || value == nullptr) return false;
++        for (int attempt = 0; attempt < 5; ++attempt) {
++            if (i2c_master_transmit_receive(py32_dev_, &reg, 1, value, 1, 200) == ESP_OK) return true;
++            vTaskDelay(pdMS_TO_TICKS(2));
++        }
++        ESP_LOGW(TAG, "PY32: read reg 0x%02X failed after 5 tries", reg);
++        return false;
+     }
+ 
+     bool Py32SetLedFrame(const uint16_t* rgb565_colors, size_t count) {
+@@ -1605,10 +1623,15 @@ private:
+             data[i * 2]     = rgb565_colors[i] & 0xFF;
+             data[i * 2 + 1] = (rgb565_colors[i] >> 8) & 0xFF;
+         }
+-        bool ok1 = Py32WriteRegBlock(0x30, data, count * 2);
+-        uint8_t refresh = (uint8_t)(count | 0x40);
+-        bool ok2 = Py32WriteRegBlock(0x24, &refresh, 1);
+-        return ok1 && ok2;
++        if (!Py32WriteRegBlock(0x30, data, count * 2)) return false;
++
++        // 0x24 = count[5:0] + latch[6]，latch 是 self-clearing strobe。
++        // 必须 read-modify-write 保留 count 与高位状态；以前直接写
++        // (count|0x40) 会把高位清掉，而且没有重试，是灯「调用了但不变色」的主因。
++        uint8_t cfg = 0;
++        if (!Py32ReadReg(0x24, &cfg)) return false;
++        uint8_t latch = (uint8_t)(cfg | (1u << 6));
++        return Py32WriteRegBlock(0x24, &latch, 1);
+     }
+ 
+     static uint16_t Rgb888To565(uint8_t r, uint8_t g, uint8_t b) {
+@@ -1622,8 +1645,8 @@ private:
+         static_cast<M5StackCoreS3Board*>(arg)->LedPatternTick();
+     }
+ 
+-    void LedPatternTick() {
+-        if (!py32_dev_ || led_pattern_.empty()) return;
++    bool LedPatternTick() {
++        if (!py32_dev_ || led_pattern_.empty()) return false;
+         uint16_t frame[12] = {};
+         int f = led_pattern_frame_++;
+         if (led_pattern_ == "rainbow") {
+@@ -1648,9 +1671,9 @@ private:
+                 frame[i] = Rgb888To565(v, v / 2, 0);
+             }
+         } else {
+-            return;
++            return false;
+         }
+-        Py32SetLedFrame(frame, 12);
++        return Py32SetLedFrame(frame, 12);
+     }
+ 
+     void StopLedPattern() {
+@@ -1687,6 +1710,12 @@ private:
+         led_pattern_ = name;
+         led_pattern_frame_ = 0;
+         led_manual_ = true;  // 暂停情绪灯联动，别把动画覆盖掉
++        // 先同步写第一帧：写不进去就别启动 timer，避免「动画在跑但灯不动」
++        if (!LedPatternTick()) {
++            StopLedPattern();
++            ESP_LOGW(TAG, "LED pattern first frame failed (I2C)");
++            return false;
++        }
+         return esp_timer_start_periodic(led_pattern_timer_, (uint64_t)speed_ms * 1000) == ESP_OK;
+     }
+ 
+@@ -1845,7 +1874,9 @@ private:
+                 uint16_t color = Rgb888To565(r, g, b);
+                 uint16_t colors[12];
+                 for (int i = 0; i < 12; i++) colors[i] = color;
+-                Py32SetLedFrame(colors, 12);
++                if (!Py32SetLedFrame(colors, 12)) {
++                    return std::string("LED I2C write failed (PY32 busy or not responding)");
++                }
+                 led_manual_ = true;
+                 ESP_LOGI(TAG, "MCP set LED color: r=%d g=%d b=%d", r, g, b);
+                 return true;
+@@ -1856,7 +1887,9 @@ private:
+             [this](const PropertyList&) -> ReturnValue {
+                 StopLedPattern();
+                 uint16_t off[12] = {};
+-                Py32SetLedFrame(off, 12);
++                if (!Py32SetLedFrame(off, 12)) {
++                    return std::string("LED I2C write failed (PY32 busy or not responding)");
++                }
+                 led_manual_ = true;
+                 ESP_LOGI(TAG, "MCP LED off");
+                 return true;
+@@ -1912,7 +1945,9 @@ private:
+                 if (count == 0) return std::string("no valid colors");
+                 for (int i = count; i < 12; i++) colors[i] = colors[count - 1];
+                 StopLedPattern();
+-                Py32SetLedFrame(colors, 12);
++                if (!Py32SetLedFrame(colors, 12)) {
++                    return std::string("LED I2C write failed (PY32 busy or not responding)");
++                }
+                 led_manual_ = true;
+                 ESP_LOGI(TAG, "MCP LED set_many: %d colors @ %d%%", count, brightness);
+                 return true;
+@@ -1925,7 +1960,9 @@ private:
+             [this](const PropertyList&) -> ReturnValue {
+                 StopLedPattern();
+                 uint16_t off[12] = {};
+-                Py32SetLedFrame(off, 12);
++                if (!Py32SetLedFrame(off, 12)) {
++                    return std::string("LED I2C write failed (PY32 busy or not responding)");
++                }
+                 led_manual_ = true;
+                 return true;
+             });
+@@ -1943,11 +1980,31 @@ private:
+                 auto name = props["name"].value<std::string>();
+                 int speed = props["speed_ms"].value<int>();
+                 if (!StartLedPattern(name, speed)) {
+-                    return std::string("unknown pattern: ") + name;
++                    return std::string("failed to start pattern '") + name +
++                           "' (unknown name or LED I2C write failed)";
+                 }
+                 ESP_LOGI(TAG, "MCP LED pattern: %s @ %dms", name.c_str(), speed);
+                 return true;
+             });
++
++        // 诊断：回读 PY32 的 0x24 配置与 0x30/0x31 第一颗灯颜色，
++        // 用来区分「工具没调用」「I2C 写失败」「写了但被别的源覆盖」。
++        mcp.AddTool("self.led.status",
++            "Read back the PY32 LED controller registers to diagnose a ring that "
++            "does not change color. Returns the config/latch register (0x24), "
++            "the first LED's RGB565 bytes (0x30/0x31), and the manual/pattern state.",
++            PropertyList(),
++            [this](const PropertyList&) -> ReturnValue {
++                uint8_t cfg = 0, lo = 0, hi = 0;
++                bool ok_cfg = Py32ReadReg(0x24, &cfg);
++                bool ok_ram = Py32ReadReg(0x30, &lo) && Py32ReadReg(0x31, &hi);
++                uint16_t rgb565 = (uint16_t)lo | ((uint16_t)hi << 8);
++                return std::string("{\"i2c_ok\":") + (ok_cfg && ok_ram ? "true" : "false") +
++                       ",\"cfg_0x24\":" + std::to_string(cfg) +
++                       ",\"led0_rgb565\":" + std::to_string(rgb565) +
++                       ",\"manual\":" + (led_manual_ ? "true" : "false") +
++                       ",\"pattern\":\"" + led_pattern_ + "\"}";
++            });
+     }
+ 
+     void RegisterServoMcpTools() {

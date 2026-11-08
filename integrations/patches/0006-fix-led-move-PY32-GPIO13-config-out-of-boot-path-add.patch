@@ -1,0 +1,155 @@
+From 0c5eded7aad8354348cf54789ef83350b014b996 Mon Sep 17 00:00:00 2001
+From: WorkBuddy <workbuddy@example.com>
+Date: Sun, 8 Nov 2026 14:41:58 +0800
+Subject: [PATCH 6/6] fix(led): move PY32 GPIO13 config out of boot path, add
+ probe/init tools
+
+Configuring GPIO13 (read-modify-write on 0x04/0x0a/0x0c/0x14) during board
+construction made the device hang right after flashing: serial stayed silent
+while esptool could still connect. Reverting boot to the known-good sequence
+(only LED count + clear frame) and exposing two manual tools instead:
+
+- self.led.probe: single-shot register read/write, to identify which
+  register access blocks the bus (no retry, 100ms timeout).
+- self.led.init: read-modify-write GPIO13 -> output + pull-up + push-pull,
+  set count, 200ms settle, clear frame; returns per-step values.
+---
+ .../boards/m5stack-core-s3/m5stack_core_s3.cc | 109 ++++++++++++++----
+ 1 file changed, 85 insertions(+), 24 deletions(-)
+
+diff --git a/main/boards/m5stack-core-s3/m5stack_core_s3.cc b/main/boards/m5stack-core-s3/m5stack_core_s3.cc
+index ca2ab63..eb9f415 100644
+--- a/main/boards/m5stack-core-s3/m5stack_core_s3.cc
++++ b/main/boards/m5stack-core-s3/m5stack_core_s3.cc
+@@ -1590,32 +1590,15 @@ private:
+             return;
+         }
+ 
+-        // 🔴 只写 LED 数量是不够的：WS2812 数据线接在 PY32 的 GPIO13，
+-        // 必须先把该脚配成「输出 + 上拉 + push-pull」，PY32 内部的 LED 引擎
+-        // 才会把 RAM 里的颜色推到灯带上。顺序照 M5 BSP / stackchan 上游：
+-        //   SetDirection(13) -> SetPullMode(13, up) -> SetDriveMode(13, push-pull)
+-        //   -> SetLedCount(12) -> 200ms settle -> 清帧 -> latch
+-        // 缺了前三步时，I2C 读写全部成功、寄存器回读也正确，但灯就是不变色。
+-        bool ok_dir = Py32WriteBit(0x04, 5, true);   // GPIO13 = output
+-        bool ok_pu  = Py32WriteBit(0x0A, 5, true);   // pull-up on
+-        bool ok_pd  = Py32WriteBit(0x0C, 5, false);  // pull-down off
+-        bool ok_drv = Py32WriteBit(0x14, 5, false);  // push-pull
++        // 注意：这里**故意不碰** PY32 的 GPIO 寄存器（0x04/0x0A/0x0C/0x14）。
++        // 2026-11-08 曾在启动阶段做 read-modify-write 配置 GPIO13，结果设备
++        // 启动阶段卡死、USB 串口 0 字节（esptool 仍能连）。GPIO13 的配置改成
++        // 手动工具 self.led.init，避免把启动流程变成不可恢复的路径。
+         uint8_t led_count = 12;
+-        bool ok_cnt = Py32WriteRegBlock(0x24, &led_count, 1);
+-        if (!ok_dir || !ok_pu || !ok_pd || !ok_drv || !ok_cnt) {
+-            ESP_LOGE(TAG, "PY32 RGB init FAILED: dir=%d pu=%d pd=%d drv=%d cnt=%d",
+-                     ok_dir, ok_pu, ok_pd, ok_drv, ok_cnt);
+-            return;
+-        }
+-        // PY32 内部 LED 引擎在 SetLedCount 之后需要约 200ms 稳定
+-        vTaskDelay(pdMS_TO_TICKS(200));
+-
++        Py32WriteRegBlock(0x24, &led_count, 1);
+         uint16_t off[12] = {};
+-        if (!Py32SetLedFrame(off, 12)) {
+-            ESP_LOGE(TAG, "PY32 RGB clear FAILED (I2C)");
+-            return;
+-        }
+-        ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, GPIO13 push-pull, off)");
++        Py32SetLedFrame(off, 12);
++        ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, off)");
+     }
+ 
+     // PY32 在内部刷 WS2812 时会短暂不响应 I2C，单次写经常 NACK。
+@@ -1645,6 +1628,19 @@ private:
+         return false;
+     }
+ 
++    // 单次、不重试的读写：给 self.led.probe / self.led.init 用。
++    // 怀疑某些寄存器读会卡住总线时，重试会把一次调用拖成好几秒，这里只试一次。
++    bool Py32ReadRegOnce(uint8_t reg, uint8_t* value) {
++        if (!py32_dev_ || value == nullptr) return false;
++        return i2c_master_transmit_receive(py32_dev_, &reg, 1, value, 1, 100) == ESP_OK;
++    }
++
++    bool Py32WriteRegOnce(uint8_t reg, uint8_t value) {
++        if (!py32_dev_) return false;
++        uint8_t buf[2] = {reg, value};
++        return i2c_master_transmit(py32_dev_, buf, 2, 100) == ESP_OK;
++    }
++
+     bool Py32SetLedFrame(const uint16_t* rgb565_colors, size_t count) {
+         if (!py32_dev_) return false;
+         if (count > 12) count = 12;
+@@ -2046,6 +2042,71 @@ private:
+                        ",\"manual\":" + (led_manual_ ? "true" : "false") +
+                        ",\"pattern\":\"" + led_pattern_ + "\"}";
+             });
++
++        // 单次寄存器读写，用来定位「哪个 PY32 寄存器操作会把 I2C 卡死」。
++        mcp.AddTool("self.led.probe",
++            "Low-level PY32 register probe (single-shot, no retry). "
++            "action: read|write, reg: 0-255, value: 0-255 (write only). "
++            "Use it to check whether 0x04/0x0a/0x0c/0x14 are readable before "
++            "configuring GPIO13.",
++            PropertyList({
++                Property("action", kPropertyTypeString),
++                Property("reg", kPropertyTypeInteger, 0, 0, 255),
++                Property("value", kPropertyTypeInteger, 0, 0, 255),
++            }),
++            [this](const PropertyList& props) -> ReturnValue {
++                auto action = props["action"].value<std::string>();
++                int reg = props["reg"].value<int>();
++                int value = props["value"].value<int>();
++                if (action == "read") {
++                    uint8_t v = 0;
++                    bool ok = Py32ReadRegOnce((uint8_t)reg, &v);
++                    return std::string("{\"ok\":") + (ok ? "true" : "false") +
++                           ",\"op\":\"read\",\"reg\":" + std::to_string(reg) +
++                           ",\"value\":" + std::to_string(ok ? (int)v : -1) + "}";
++                }
++                if (action == "write") {
++                    bool ok = Py32WriteRegOnce((uint8_t)reg, (uint8_t)value);
++                    return std::string("{\"ok\":") + (ok ? "true" : "false") +
++                           ",\"op\":\"write\",\"reg\":" + std::to_string(reg) +
++                           ",\"value\":" + std::to_string(value) + "}";
++                }
++                return std::string("action must be read or write");
++            });
++
++        // 手动配置 PY32 GPIO13（WS2812 数据线）：输出 + 上拉 + push-pull。
++        // 只在显式调用时执行，不放进启动流程，避免像 2026-11-08 那次把设备卡死。
++        mcp.AddTool("self.led.init",
++            "Configure PY32 GPIO13 (the WS2812 data line) as output + pull-up + "
++            "push-pull, then set LED count and clear the strip. Required before "
++            "the ring can change colour. Returns per-step register values; "
++            "-1 means read failed, -2 means write failed.",
++            PropertyList(),
++            [this](const PropertyList&) -> ReturnValue {
++                auto rmw = [this](uint8_t reg, uint8_t bit, bool value) -> int {
++                    uint8_t cur = 0;
++                    if (!Py32ReadRegOnce(reg, &cur)) return -1;
++                    uint8_t next = value ? (uint8_t)(cur | (1u << bit))
++                                         : (uint8_t)(cur & ~(1u << bit));
++                    return Py32WriteRegOnce(reg, next) ? (int)next : -2;
++                };
++                int dir = rmw(0x04, 5, true);   // GPIO13 = output
++                int pu  = rmw(0x0A, 5, true);   // pull-up on
++                int pd  = rmw(0x0C, 5, false);  // pull-down off
++                int drv = rmw(0x14, 5, false);  // push-pull
++                bool ok_cnt = Py32WriteRegOnce(0x24, 12);
++                vTaskDelay(pdMS_TO_TICKS(200));
++                uint16_t off[12] = {};
++                bool ok_frame = Py32SetLedFrame(off, 12);
++                ESP_LOGI(TAG, "MCP led.init: dir=%d pu=%d pd=%d drv=%d cnt=%d frame=%d",
++                         dir, pu, pd, drv, ok_cnt, ok_frame);
++                return std::string("{\"dir_0x04\":") + std::to_string(dir) +
++                       ",\"pu_0x0a\":" + std::to_string(pu) +
++                       ",\"pd_0x0c\":" + std::to_string(pd) +
++                       ",\"drv_0x14\":" + std::to_string(drv) +
++                       ",\"count\":" + (ok_cnt ? "true" : "false") +
++                       ",\"frame\":" + (ok_frame ? "true" : "false") + "}";
++            });
+     }
+ 
+     void RegisterServoMcpTools() {
