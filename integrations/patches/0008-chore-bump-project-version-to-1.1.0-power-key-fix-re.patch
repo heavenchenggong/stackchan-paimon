@@ -1,0 +1,23 @@
+From ac9dabcc51e837fe5249aeba8d3ba9ed6758b38b Mon Sep 17 00:00:00 2001
+From: Heaven Gong <heavenchenggong@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 15:41:13 +0800
+Subject: [PATCH 8/8] chore: bump project version to 1.1.0 (power-key fix
+ release)
+
+---
+ CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 895f23a..3efd70b 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,7 +9,7 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+ # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
+ idf_build_set_property(MINIMAL_BUILD ON)
+ 
+-set(PROJECT_VER "0.0.2")
++set(PROJECT_VER "1.1.0")
+ project(StackChan-XiaoZhi)
+ 
+ # ----------------------------------------------------------------------

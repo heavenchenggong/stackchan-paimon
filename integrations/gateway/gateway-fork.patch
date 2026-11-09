@@ -1,0 +1,35 @@
+--- a/stackchan_mcp/stdio_server.py
++++ b/stackchan_mcp/stdio_server.py
+@@ -1273,6 +1273,10 @@
+             arguments,
+         ),
+     }
++
++    # --- FORK compat: 把 self.robot.* / self.display.* 改派到派蒙固件 ---
++    from .fork_compat import apply_fork_compat
++    tool_map = apply_fork_compat(tool_map, arguments)
+ 
+     if name not in tool_map:
+         return [
+--- a/stackchan_mcp/esp32_client.py
++++ b/stackchan_mcp/esp32_client.py
+@@ -58,6 +58,10 @@
+     "self.audio_speaker.": "audio",
+     "self.camera.": "camera",
+     "self.touch.": "touch",
++    "self.head.": "servo",
++    "self.face.": "avatar",
++    "self.notify.": "notify",
++    "self.gateway_config.": "gateway",
+     "self.get_device_status": "status",
+ }
+ 
+@@ -72,6 +76,8 @@
+     "audio",
+     "camera",
+     "touch",
++    "notify",
++    "gateway",
+     "status",
+     "default",
+ )

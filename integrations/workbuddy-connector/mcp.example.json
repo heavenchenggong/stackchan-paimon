@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "stackchan": {
+      "command": "python3",
+      "args": ["/Users/you/stackchan-paimon/integrations/workbuddy-connector/stackchan_connector.py"],
+      "env": {
+        "STACKCHAN_TRANSPORT": "http",
+        "STACKCHAN_URL": "http://192.168.1.50:8788",
+        "STACKCHAN_SERIAL": "/dev/cu.usbmodem1101"
+      },
+      "disabled": false,
+      "description": "桌面机器人：提醒/表情/12灯动画/头部动作/状态/配置（22 工具）"
+    }
+  }
+}

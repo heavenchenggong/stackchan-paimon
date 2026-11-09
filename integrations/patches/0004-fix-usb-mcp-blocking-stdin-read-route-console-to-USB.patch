@@ -1,0 +1,75 @@
+From d74a0d1cb197125fa5a27802bed4dff1fbe50ecc Mon Sep 17 00:00:00 2001
+From: WorkBuddy <workbuddy@example.com>
+Date: Sun, 8 Nov 2026 12:03:01 +0800
+Subject: [PATCH 4/8] fix(usb-mcp): blocking stdin read + route console to USB
+ Serial/JTAG
+
+- remove O_NONBLOCK: ESP-IDF usb_serial_jtag VFS kept returning EAGAIN,
+  so requests written over the data cable were never consumed.
+- sdkconfig.defaults.esp32s3: make USB Serial/JTAG the primary console
+  (default was UART0 primary + USB Serial/JTAG secondary log-only, which
+  explains 'logs visible but stdin empty').
+---
+ main/usb_mcp_bridge.cc     | 17 +++++------------
+ sdkconfig.defaults.esp32s3 |  6 ++++++
+ 2 files changed, 11 insertions(+), 12 deletions(-)
+
+diff --git a/main/usb_mcp_bridge.cc b/main/usb_mcp_bridge.cc
+index 946e50e..e959ec9 100644
+--- a/main/usb_mcp_bridge.cc
++++ b/main/usb_mcp_bridge.cc
+@@ -8,7 +8,6 @@
+ 
+ #include <cJSON.h>
+ #include <esp_log.h>
+-#include <fcntl.h>
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/task.h>
+ #include <unistd.h>
+@@ -74,11 +73,8 @@ static void UsbMcpHandleLine(const std::string& line) {
+ }
+ 
+ static void UsbMcpTask(void*) {
+-    // 非阻塞读 stdin（ESP32-S3 的 console 默认走 USB Serial/JTAG VFS）。
+-    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+-    if (flags >= 0) {
+-        fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+-    }
++    // 阻塞读 stdin。这是独立 task，阻塞无妨；之前设 O_NONBLOCK 会让
++    // ESP-IDF 的 usb_serial_jtag VFS 一直返回 EAGAIN，命令根本读不进来。
+     ESP_LOGI(TAG, "USB MCP bridge ready: send one JSON line per request");
+ 
+     std::string line;
+@@ -98,12 +94,9 @@ static void UsbMcpTask(void*) {
+                     if (line.size() > 4096) line.clear();  // 防止超长行吃内存
+                 }
+             }
+-        } else {
+-            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+-                vTaskDelay(pdMS_TO_TICKS(100));
+-            } else {
+-                vTaskDelay(pdMS_TO_TICKS(20));
+-            }
++        } else if (n < 0) {
++            ESP_LOGW(TAG, "stdin read failed (errno=%d)", errno);
++            vTaskDelay(pdMS_TO_TICKS(500));
+         }
+     }
+ }
+diff --git a/sdkconfig.defaults.esp32s3 b/sdkconfig.defaults.esp32s3
+index 6c177a5..6a3e6ef 100644
+--- a/sdkconfig.defaults.esp32s3
++++ b/sdkconfig.defaults.esp32s3
+@@ -2,6 +2,12 @@
+ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+ CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+ 
++# 把主 console（含 stdin）接到 USB Serial/JTAG，数据线才能双向传 MCP JSON-RPC。
++# 默认主 console 是 UART0、USB Serial/JTAG 只做 secondary 日志输出，
++# 那样日志能看但 read(stdin) 永远读不到 Mac 发来的命令。
++CONFIG_ESP_CONSOLE_UART_DEFAULT=n
++CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
++
+ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+ 
+ CONFIG_SPIRAM=y

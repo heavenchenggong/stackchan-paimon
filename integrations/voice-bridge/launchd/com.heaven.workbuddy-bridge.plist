@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.heaven.workbuddy-bridge</string>
+
+    <!-- 改成你 clone 后 run_bridge.sh 的绝对路径 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/you/stackchan-paimon/integrations/voice-bridge/run_bridge.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>/Users/you/stackchan-paimon/integrations/voice-bridge</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/wb-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/wb-bridge.err</string>
+</dict>
+</plist>

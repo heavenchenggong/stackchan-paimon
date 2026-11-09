@@ -1,0 +1,260 @@
+From e823299df986a6add233755320c0f667de6099f6 Mon Sep 17 00:00:00 2001
+From: WorkBuddy <workbuddy@example.com>
+Date: Sun, 8 Nov 2026 11:45:00 +0800
+Subject: [PATCH 3/8] feat(usb-mcp): add USB Serial/JTAG JSON-RPC channel, no
+ Wi-Fi needed
+
+- McpServer: separate kUsbRpcIdBase=2000000 + SetUsbResultSink so the serial
+  bridge does not depend on the HTTP server (which only starts after Wi-Fi).
+- new usb_mcp_bridge.{h,cc}: non-blocking stdin task reads one JSON line per
+  request, forwards to McpServer::ParseMessage(), prints __MCP_RESULT__ line.
+  Supports both shorthand {tool,arguments} and standard JSON-RPC.
+- main.cc: UsbMcpStart() before Application::Run(); CMakeLists adds source.
+- companion Mac client: analysis/integration/usb_mcp_client.py (pyserial).
+---
+ main/CMakeLists.txt    |   1 +
+ main/main.cc           |   4 ++
+ main/mcp_server.cc     |   8 +++
+ main/mcp_server.h      |   5 ++
+ main/usb_mcp_bridge.cc | 115 +++++++++++++++++++++++++++++++++++++++++
+ main/usb_mcp_bridge.h  |  20 +++++++
+ 6 files changed, 153 insertions(+)
+ create mode 100644 main/usb_mcp_bridge.cc
+ create mode 100644 main/usb_mcp_bridge.h
+
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 80a8014..c4eabb2 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -31,6 +31,7 @@ set(SOURCES "audio/audio_codec.cc"
+             "protocols/websocket_protocol.cc"
+             "mcp_server.cc"
+             "notify_http_server.cc"
++            "usb_mcp_bridge.cc"
+             "system_info.cc"
+             "application.cc"
+             "ota.cc"
+diff --git a/main/main.cc b/main/main.cc
+index f7e8bc3..49de790 100755
+--- a/main/main.cc
++++ b/main/main.cc
+@@ -8,6 +8,7 @@
+ #include <freertos/task.h>
+ 
+ #include "application.h"
++#include "usb_mcp_bridge.h"
+ 
+ #define TAG "main"
+ 
+@@ -25,5 +26,8 @@ extern "C" void app_main(void)
+     // Initialize and run the application
+     auto& app = Application::GetInstance();
+     app.Initialize();
++    // 数据线（USB Serial/JTAG）上的 MCP 通道，不依赖 Wi-Fi；
++    // 独立 task，放在 Run() 之前启动。
++    UsbMcpStart();
+     app.Run();  // This function runs the main event loop and never returns
+ }
+diff --git a/main/mcp_server.cc b/main/mcp_server.cc
+index 5dbb87d..c184158 100644
+--- a/main/mcp_server.cc
++++ b/main/mcp_server.cc
+@@ -408,6 +408,10 @@ void McpServer::ReplyResult(int id, const std::string& result) {
+     payload += std::to_string(id) + ",\"result\":";
+     payload += result;
+     payload += "}";
++    if (id >= kUsbRpcIdBase && usb_result_sink_) {
++        usb_result_sink_(id, payload);
++        return;
++    }
+     if (id >= kHttpRpcIdBase && result_sink_) {
+         result_sink_(id, payload);
+         return;
+@@ -421,6 +425,10 @@ void McpServer::ReplyError(int id, const std::string& message) {
+     payload += ",\"error\":{\"message\":\"";
+     payload += message;
+     payload += "\"}}";
++    if (id >= kUsbRpcIdBase && usb_result_sink_) {
++        usb_result_sink_(id, payload);
++        return;
++    }
+     if (id >= kHttpRpcIdBase && result_sink_) {
+         result_sink_(id, payload);
+         return;
+diff --git a/main/mcp_server.h b/main/mcp_server.h
+index 8013cee..6b56aa8 100644
+--- a/main/mcp_server.h
++++ b/main/mcp_server.h
+@@ -319,6 +319,9 @@ public:
+     // SetResultSink() 注册的同步接收器，让局域网 HTTP 调用也能拿到工具返回值。
+     // 云端 wss 的 id 都是小整数，完全不受影响。
+     static constexpr int kHttpRpcIdBase = 1000000;
++    // USB Serial/JTAG 串口桥（usb_mcp_bridge）专用 id 段，与 HTTP 桥互不干扰，
++    // 也不依赖 HTTP server 是否已经启动（Wi-Fi 没连时也能用）。
++    static constexpr int kUsbRpcIdBase = 2000000;
+ 
+     using ResultSink = std::function<void(int id, const std::string& jsonrpc_response)>;
+ 
+@@ -329,6 +332,7 @@ public:
+ 
+     // 传 nullptr 取消接收。仅在设备本地 HTTP 服务启动时设置一次。
+     void SetResultSink(ResultSink sink) { result_sink_ = std::move(sink); }
++    void SetUsbResultSink(ResultSink sink) { usb_result_sink_ = std::move(sink); }
+ 
+     void AddCommonTools();
+     void AddUserOnlyTools();
+@@ -352,6 +356,7 @@ private:
+ 
+     std::vector<McpTool*> tools_;
+     ResultSink result_sink_;
++    ResultSink usb_result_sink_;
+ };
+ 
+ #endif // MCP_SERVER_H
+diff --git a/main/usb_mcp_bridge.cc b/main/usb_mcp_bridge.cc
+new file mode 100644
+index 0000000..946e50e
+--- /dev/null
++++ b/main/usb_mcp_bridge.cc
+@@ -0,0 +1,115 @@
++#include "usb_mcp_bridge.h"
++#include "mcp_server.h"
++
++#include <atomic>
++#include <cerrno>
++#include <cstdio>
++#include <string>
++
++#include <cJSON.h>
++#include <esp_log.h>
++#include <fcntl.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <unistd.h>
++
++static const char* TAG = "UsbMcp";
++static std::atomic<int> g_next_id{McpServer::kUsbRpcIdBase};
++
++static void UsbMcpDeliverResult(int id, const std::string& payload) {
++    (void)id;
++    // 用固定前缀，Mac 端按行过滤，避免和 ESP_LOG 日志混在一起。
++    printf("__MCP_RESULT__%s\n", payload.c_str());
++    fflush(stdout);
++}
++
++static void UsbMcpSendError(const char* message) {
++    printf("__MCP_RESULT__{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"message\":\"%s\"}}\n", message);
++    fflush(stdout);
++}
++
++static void UsbMcpHandleLine(const std::string& line) {
++    if (line.empty() || line[0] != '{') return;  // 不是 JSON，忽略
++    cJSON* in = cJSON_Parse(line.c_str());
++    if (in == nullptr || !cJSON_IsObject(in)) {
++        if (in) cJSON_Delete(in);
++        UsbMcpSendError("invalid JSON object");
++        return;
++    }
++
++    int id = g_next_id.fetch_add(1);
++    cJSON* req = cJSON_CreateObject();
++    cJSON_AddStringToObject(req, "jsonrpc", "2.0");
++    cJSON_AddNumberToObject(req, "id", id);
++
++    cJSON* method = cJSON_GetObjectItem(in, "method");
++    cJSON* tool = cJSON_GetObjectItem(in, "tool");
++    bool valid = false;
++    if (method != nullptr && cJSON_IsString(method)) {
++        cJSON_AddStringToObject(req, "method", method->valuestring);
++        cJSON* params = cJSON_GetObjectItem(in, "params");
++        cJSON_AddItemToObject(req, "params",
++                              params != nullptr ? cJSON_Duplicate(params, true)
++                                               : cJSON_CreateObject());
++        valid = true;
++    } else if (tool != nullptr && cJSON_IsString(tool)) {
++        cJSON_AddStringToObject(req, "method", "tools/call");
++        cJSON* params = cJSON_CreateObject();
++        cJSON_AddStringToObject(params, "name", tool->valuestring);
++        cJSON* args = cJSON_GetObjectItem(in, "arguments");
++        cJSON_AddItemToObject(params, "arguments",
++                              args != nullptr ? cJSON_Duplicate(args, true)
++                                             : cJSON_CreateObject());
++        cJSON_AddItemToObject(req, "params", params);
++        valid = true;
++    }
++
++    if (valid) {
++        McpServer::GetInstance().ParseMessage(req);
++    } else {
++        UsbMcpSendError("need method or tool");
++    }
++    cJSON_Delete(req);
++    cJSON_Delete(in);
++}
++
++static void UsbMcpTask(void*) {
++    // 非阻塞读 stdin（ESP32-S3 的 console 默认走 USB Serial/JTAG VFS）。
++    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
++    if (flags >= 0) {
++        fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
++    }
++    ESP_LOGI(TAG, "USB MCP bridge ready: send one JSON line per request");
++
++    std::string line;
++    char buf[256];
++    for (;;) {
++        int n = (int)read(STDIN_FILENO, buf, sizeof(buf));
++        if (n > 0) {
++            for (int i = 0; i < n; i++) {
++                char c = buf[i];
++                if (c == '\n' || c == '\r') {
++                    if (!line.empty()) {
++                        UsbMcpHandleLine(line);
++                        line.clear();
++                    }
++                } else {
++                    line.push_back(c);
++                    if (line.size() > 4096) line.clear();  // 防止超长行吃内存
++                }
++            }
++        } else {
++            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
++                vTaskDelay(pdMS_TO_TICKS(100));
++            } else {
++                vTaskDelay(pdMS_TO_TICKS(20));
++            }
++        }
++    }
++}
++
++void UsbMcpStart() {
++    // 独立于 NotifyHttpServer：即使 Wi-Fi 没连、:8788 没起来，串口桥也能用。
++    McpServer::GetInstance().SetUsbResultSink(&UsbMcpDeliverResult);
++    xTaskCreate(&UsbMcpTask, "usb_mcp", 4096, nullptr, 2, nullptr);
++}
+diff --git a/main/usb_mcp_bridge.h b/main/usb_mcp_bridge.h
+new file mode 100644
+index 0000000..99ce7f2
+--- /dev/null
++++ b/main/usb_mcp_bridge.h
+@@ -0,0 +1,20 @@
++#ifndef USB_MCP_BRIDGE_H
++#define USB_MCP_BRIDGE_H
++
++// USB Serial/JTAG 串口 MCP 通道 —— 不依赖 Wi-Fi，数据线直连就能调设备全部工具。
++//
++// 协议：Mac 端往串口写**一行** JSON，设备回**一行**以 __MCP_RESULT__ 开头的
++// 完整 JSON-RPC 2.0 响应。其余行是普通 ESP_LOG 日志，忽略即可。
++//
++//   写: {"tool":"self.led.set_color","arguments":{"r":255,"g":0,"b":0}}\n
++//   写: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n
++//   读: __MCP_RESULT__{"jsonrpc":"2.0","id":2000000,"result":{"content":[...]}}
++//
++// 实现上复用 McpServer::ParseMessage()，工具执行仍在主事件循环；
++// 响应经 McpServer::SetUsbResultSink() 回到串口，与 :8788 的 HTTP 桥
++// （1000000 段）用不同 id 段隔离，互不干扰。
++
++// 在 app_main() 里、Application::Run() 之前调用一次。
++void UsbMcpStart();
++
++#endif  // USB_MCP_BRIDGE_H

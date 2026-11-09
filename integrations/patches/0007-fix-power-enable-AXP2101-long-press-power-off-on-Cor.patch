@@ -1,0 +1,41 @@
+From 8567c459243938fb7afcf2ed739678055d557309 Mon Sep 17 00:00:00 2001
+From: Heaven Gong <heavenchenggong@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 14:55:08 +0800
+Subject: [PATCH 7/8] fix(power): enable AXP2101 long-press power off on CoreS3
+
+The CoreS3 Pmic ctor only configured power rails. AXP2101's
+PWRON > OFFLEVEL power-off source was never enabled, so holding the
+power key triggered a hardware reset (reboot) instead of cutting power;
+with the internal battery, unplugging USB did not shut it down either.
+
+Port the same two registers already used by kevin-box-2, tudouzi and the
+waveshare boards:
+  0x22 = 0b110 -> PWRON > OFFLEVEL as POWEROFF source enable
+  0x27 = 0x10  -> hold 4s to power off
+
+Automatic sleep/shutdown timers stay disabled (-1/-1/-1), so wake-word
+always-on behaviour is unchanged.
+---
+ main/boards/m5stack-core-s3/m5stack_core_s3.cc | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/main/boards/m5stack-core-s3/m5stack_core_s3.cc b/main/boards/m5stack-core-s3/m5stack_core_s3.cc
+index eb9f415..7959fdb 100644
+--- a/main/boards/m5stack-core-s3/m5stack_core_s3.cc
++++ b/main/boards/m5stack-core-s3/m5stack_core_s3.cc
+@@ -1272,6 +1272,15 @@ class Pmic : public Axp2101 {
+ public:
+     // Power Init
+     Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
++        // 长按电源键 4 秒真正断电。之前这里只配了电源轨，AXP2101 的
++        // PWRON > OFFLEVEL 关机源没开，长按 6 秒只触发硬件复位（重启），
++        // 加上内置电池，看起来就是「怎么都关不掉」。
++        // 0x22 bit2: PWRON > OFFLEVEL as POWEROFF source enable
++        // 0x27 0x10: hold 4s to power off
++        // 写法与 kevin-box-2 / tudouzi / waveshare 等板卡一致。
++        WriteReg(0x22, 0b110);
++        WriteReg(0x27, 0x10);
++
+         uint8_t data = ReadReg(0x90);
+         data |= 0b10110100;
+         WriteReg(0x90, data);
